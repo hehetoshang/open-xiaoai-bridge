@@ -125,6 +125,20 @@ class SpeakerManager:
         )
         await open_xiaoai_server.stop_playing()
 
+    async def pause_playback(self) -> bool:
+        """暂停媒体播放器（mediaplayer）的当前播放"""
+        res = await self.run_shell(
+            "ubus call mediaplayer player_play_operation '{\"action\":\"pause\"}'"
+        )
+        return '"code": 0' in res.stdout if res else False
+
+    async def resume_playback(self) -> bool:
+        """恢复媒体播放器（mediaplayer）的暂停播放"""
+        res = await self.run_shell(
+            "ubus call mediaplayer player_play_operation '{\"action\":\"play\"}'"
+        )
+        return '"code": 0' in res.stdout if res else False
+
     async def wake_up(self, awake=True, silent=True):
         """
         （取消）唤醒小爱

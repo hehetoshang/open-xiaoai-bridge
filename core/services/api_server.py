@@ -38,6 +38,15 @@ class APIServer:
         self.app.router.add_get("/api/status", self.handle_get_status)
         self.app.router.add_post("/api/wakeup", self.handle_wakeup)
         self.app.router.add_post("/api/interrupt", self.handle_stop)
+        self.app.router.add_post("/api/play/pause", self.handle_pause_playback)
+        self.app.router.add_post("/api/play/resume", self.handle_resume_playback)
+        # StreamPlayer（中转推流）端点
+        self.app.router.add_post("/api/stream/play", self.handle_stream_play)
+        self.app.router.add_post("/api/stream/pause", self.handle_stream_pause)
+        self.app.router.add_post("/api/stream/resume", self.handle_stream_resume)
+        self.app.router.add_post("/api/stream/seek", self.handle_stream_seek)
+        self.app.router.add_post("/api/stream/stop", self.handle_stream_stop)
+        self.app.router.add_get("/api/stream/status", self.handle_stream_status)
         self.app.router.add_get("/api/health", self.handle_health)
         # TTS endpoints
         self.app.router.add_post("/api/tts/doubao", self.handle_tts_doubao)
@@ -369,6 +378,208 @@ class APIServer:
 
         except Exception as e:
             logger.error(f"[APIServer] Error interrupting: {e}")
+            return web.json_response(
+                {"success": False, "error": str(e)},
+                status=500
+            )
+
+    async def handle_pause_playback(self, request: web.Request) -> web.Response:
+        """
+        POST /api/play/pause
+        Pause current media playback
+        """
+        try:
+            speaker = get_speaker()
+            if not speaker:
+                return web.json_response(
+                    {"success": False, "error": "Speaker not initialized"},
+                    status=503
+                )
+
+            result = await speaker.pause_playback()
+            return web.json_response({"success": result})
+        except Exception as e:
+            logger.error(f"[APIServer] Error pausing playback: {e}")
+            return web.json_response(
+                {"success": False, "error": str(e)},
+                status=500
+            )
+
+    async def handle_resume_playback(self, request: web.Request) -> web.Response:
+        """
+        POST /api/play/resume
+        Resume paused media playback
+        """
+        try:
+            speaker = get_speaker()
+            if not speaker:
+                return web.json_response(
+                    {"success": False, "error": "Speaker not initialized"},
+                    status=503
+                )
+
+            result = await speaker.resume_playback()
+            return web.json_response({"success": result})
+        except Exception as e:
+            logger.error(f"[APIServer] Error resuming playback: {e}")
+            return web.json_response(
+                {"success": False, "error": str(e)},
+                status=500
+            )
+
+    async def handle_stream_play(self, request: web.Request) -> web.Response:
+        """
+        POST /api/stream/play
+        下载并中转播放音频 URL（支持后续 pause/resume/seek）
+
+        Request body:
+            {
+                "url": "https://.../song.mp3",   # required
+                "headers": {"User-Agent": "..."}, # optional，防盗链用
+                "start_ms": 0,                    # optional，起始位置
+                "loop": false                     # optional，单曲循环
+            }
+        """
+        try:
+            data = await request.json()
+            url = data.get("url")
+            if not url:
+                return web.json_response(
+                    {"success": False, "error": "Missing required field: url"},
+                    status=400
+                )
+
+            from core.ref import get_stream_player
+
+            player = get_stream_player()
+            if not player:
+                return web.json_response(
+                    {"success": False, "error": "StreamPlayer not initialized"},
+                    status=503
+                )
+
+            result = await player.play(
+                url,
+                headers=data.get("headers") or None,
+                start_ms=int(data.get("start_ms", 0) or 0),
+                loop=bool(data.get("loop", False)),
+            )
+            return web.json_response({"success": True, "data": result})
+        except Exception as e:
+            logger.error(f"[APIServer] Stream play failed: {e}")
+            return web.json_response(
+                {"success": False, "error": str(e)},
+                status=500
+            )
+
+    async def handle_stream_pause(self, request: web.Request) -> web.Response:
+        """POST /api/stream/pause — 暂停中转播放（可恢复）"""
+        try:
+            from core.ref import get_stream_player
+
+            player = get_stream_player()
+            if not player:
+                return web.json_response(
+                    {"success": False, "error": "StreamPlayer not initialized"},
+                    status=503
+                )
+            result = await player.pause()
+            return web.json_response({"success": True, "data": result})
+        except Exception as e:
+            logger.error(f"[APIServer] Stream pause failed: {e}")
+            return web.json_response(
+                {"success": False, "error": str(e)},
+                status=500
+            )
+
+    async def handle_stream_resume(self, request: web.Request) -> web.Response:
+        """POST /api/stream/resume — 恢复中转播放"""
+        try:
+            from core.ref import get_stream_player
+
+            player = get_stream_player()
+            if not player:
+                return web.json_response(
+                    {"success": False, "error": "StreamPlayer not initialized"},
+                    status=503
+                )
+            result = await player.resume()
+            return web.json_response({"success": True, "data": result})
+        except Exception as e:
+            logger.error(f"[APIServer] Stream resume failed: {e}")
+            return web.json_response(
+                {"success": False, "error": str(e)},
+                status=500
+            )
+
+    async def handle_stream_seek(self, request: web.Request) -> web.Response:
+        """
+        POST /api/stream/seek
+        跳转到指定位置
+
+        Request body:
+            {"position_ms": 60000}   # required，目标位置（毫秒）
+        """
+        try:
+            data = await request.json()
+            position_ms = int(data.get("position_ms") or 0)
+            if position_ms < 0:
+                return web.json_response(
+                    {"success": False, "error": "position_ms must be >= 0"},
+                    status=400
+                )
+
+            from core.ref import get_stream_player
+
+            player = get_stream_player()
+            if not player:
+                return web.json_response(
+                    {"success": False, "error": "StreamPlayer not initialized"},
+                    status=503
+                )
+            result = await player.seek(position_ms)
+            return web.json_response({"success": True, "data": result})
+        except Exception as e:
+            logger.error(f"[APIServer] Stream seek failed: {e}")
+            return web.json_response(
+                {"success": False, "error": str(e)},
+                status=500
+            )
+
+    async def handle_stream_stop(self, request: web.Request) -> web.Response:
+        """POST /api/stream/stop — 停止中转播放并清空状态"""
+        try:
+            from core.ref import get_stream_player
+
+            player = get_stream_player()
+            if not player:
+                return web.json_response(
+                    {"success": False, "error": "StreamPlayer not initialized"},
+                    status=503
+                )
+            result = await player.stop()
+            return web.json_response({"success": True, "data": result})
+        except Exception as e:
+            logger.error(f"[APIServer] Stream stop failed: {e}")
+            return web.json_response(
+                {"success": False, "error": str(e)},
+                status=500
+            )
+
+    async def handle_stream_status(self, request: web.Request) -> web.Response:
+        """GET /api/stream/status — 中转播放状态"""
+        try:
+            from core.ref import get_stream_player
+
+            player = get_stream_player()
+            if not player:
+                return web.json_response(
+                    {"success": False, "error": "StreamPlayer not initialized"},
+                    status=503
+                )
+            return web.json_response({"success": True, "data": player.get_status()})
+        except Exception as e:
+            logger.error(f"[APIServer] Stream status failed: {e}")
             return web.json_response(
                 {"success": False, "error": str(e)},
                 status=500

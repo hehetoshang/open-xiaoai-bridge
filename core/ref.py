@@ -67,3 +67,11 @@ def set_speech_frames(speech_frames: Any):
 
 def get_speech_frames() -> Any:
     return GLOBAL_STATES.get("speech_frames")
+
+
+def set_stream_player(stream_player: Any):
+    GLOBAL_STATES["stream_player"] = stream_player
+
+
+def get_stream_player() -> Any:
+    return GLOBAL_STATES.get("stream_player")
