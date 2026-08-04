@@ -5,6 +5,7 @@ including Hermes Agent API server mode.
 """
 
 import asyncio
+import json
 import uuid
 from typing import Any
 
@@ -44,7 +45,10 @@ class OpenAIManager:
     _tts_speed = 1.0
     _rule_prompt = ""
     _rule_prompt_for_skill = ""
-    _sessions: dict[str, list[dict[str, str]]] = {}
+    # MCP 外部工具（function calling）
+    _use_mcp_tools = False
+    _max_tool_rounds = 5
+    _sessions: dict[str, list[dict[str, Any]]] = {}
     _response_events: dict[str, asyncio.Future] = {}
     _response_texts: dict[str, str] = {}
     _response_tts_speakers: dict[str, str | None] = {}
@@ -104,6 +108,9 @@ class OpenAIManager:
         cls._tts_speed = float(config.get("tts_speed", 1.0))
         cls._rule_prompt = str(config.get("rule_prompt", "") or "")
         cls._rule_prompt_for_skill = str(config.get("rule_prompt_for_skill", "") or "")
+        # MCP 外部工具（function calling）：需同时配置 config.py 的 mcp_servers 段
+        cls._use_mcp_tools = bool(config.get("use_mcp_tools", False))
+        cls._max_tool_rounds = max(1, int(config.get("max_tool_rounds", 5)))
 
         if cls._enabled:
             logger.info(
@@ -148,6 +155,13 @@ class OpenAIManager:
         if not cls._initialized:
             cls.initialize_from_config()
         return cls._enabled
+
+    @classmethod
+    def uses_mcp_tools(cls) -> bool:
+        """是否启用外部 MCP 工具（function calling）"""
+        if not cls._initialized:
+            cls.initialize_from_config()
+        return cls._use_mcp_tools
 
     @classmethod
     def set_session_key(cls, session_key: str):
@@ -250,36 +264,127 @@ class OpenAIManager:
         session_key = cls._session_key
         history = cls._sessions.setdefault(session_key, [])
         messages = cls._build_messages(history, text)
-        payload: dict[str, Any] = {
-            "model": cls._model,
-            "messages": messages,
-            "stream": False,
-            **cls._extra_body,
-        }
-        if cls._temperature is not None:
-            payload["temperature"] = cls._temperature
-        if cls._max_tokens is not None:
-            payload["max_tokens"] = cls._max_tokens
-
-        headers = cls._headers()
+        final_text: str | None = None
 
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=cls._timeout)
-        ) as session:
-            async with session.post(
-                cls._chat_completions_url(),
-                json=payload,
-                headers=headers,
-            ) as response:
-                body = await response.json(content_type=None)
-                if response.status >= 400:
-                    message = body.get("error", body) if isinstance(body, dict) else body
-                    raise RuntimeError(f"HTTP {response.status}: {message}")
+        ) as http_session:
+            # 工具调用循环：模型返回 tool_calls → 执行 → 追加 tool 消息 → 重发
+            # 中间消息只在单次请求内使用，history 仍只存最终文本对（行为不变）
+            for _round in range(cls._max_tool_rounds + 1):
+                payload: dict[str, Any] = {
+                    "model": cls._model,
+                    "messages": messages,
+                    "stream": False,
+                    **cls._extra_body,
+                }
+                if cls._temperature is not None:
+                    payload["temperature"] = cls._temperature
+                if cls._max_tokens is not None:
+                    payload["max_tokens"] = cls._max_tokens
+                if cls._use_mcp_tools:
+                    from core.mcp_client import MCPClientManager
 
-        response_text = cls._extract_response_text(body)
-        if response_text:
-            cls._append_history(history, text, response_text)
-        return response_text
+                    tools = MCPClientManager.get_tools()
+                    if tools:
+                        payload["tools"] = tools
+
+                body = await cls._post_chat_completion(http_session, payload)
+                message = cls._extract_message(body)
+                tool_calls = (
+                    message.get("tool_calls")
+                    if isinstance(message, dict) and message.get("tool_calls")
+                    else None
+                )
+
+                if not tool_calls:
+                    final_text = cls._extract_response_text(body)
+                    break
+
+                if _round >= cls._max_tool_rounds:
+                    # 已达工具调用上限，不再执行，终止循环
+                    logger.warning(
+                        f"[OpenAI] 工具调用循环达到上限 {cls._max_tool_rounds} 次"
+                    )
+                    break
+
+                # 追加 assistant 消息（含 tool_calls；content 为 null 时显式置 None）
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": message.get("content") or None,
+                        "tool_calls": tool_calls,
+                    }
+                )
+                # 并发执行本轮的多个工具调用
+                results = await asyncio.gather(
+                    *(cls._run_tool_call(tc) for tc in tool_calls),
+                    return_exceptions=True,
+                )
+                for tc, result in zip(tool_calls, results):
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc.get("id", ""),
+                            "content": (
+                                str(result)
+                                if not isinstance(result, Exception)
+                                else f"工具执行失败: {result}"
+                            ),
+                        }
+                    )
+            else:
+                logger.warning(
+                    f"[OpenAI] 工具调用循环达到上限 {cls._max_tool_rounds} 次"
+                )
+
+        if final_text:
+            cls._append_history(history, text, final_text)
+        return final_text
+
+    @classmethod
+    async def _post_chat_completion(cls, http_session, payload: dict[str, Any]) -> Any:
+        """发送 chat completion 请求并返回响应 body"""
+        async with http_session.post(
+            cls._chat_completions_url(),
+            json=payload,
+            headers=cls._headers(),
+        ) as response:
+            body = await response.json(content_type=None)
+            if response.status >= 400:
+                message = body.get("error", body) if isinstance(body, dict) else body
+                raise RuntimeError(f"HTTP {response.status}: {message}")
+        return body
+
+    @classmethod
+    def _extract_message(cls, body: Any) -> dict | None:
+        """从响应 body 提取第一条 message"""
+        if not isinstance(body, dict):
+            return None
+        choices = body.get("choices")
+        if not choices:
+            return None
+        first = choices[0]
+        if not isinstance(first, dict):
+            return None
+        message = first.get("message")
+        return message if isinstance(message, dict) else None
+
+    @classmethod
+    async def _run_tool_call(cls, tool_call: dict[str, Any]) -> str:
+        """执行单个 tool_call（从 MCP client 路由到外部 server）"""
+        from core.mcp_client import MCPClientManager
+
+        fn = tool_call.get("function") or {}
+        name = fn.get("name") or ""
+        raw_args = fn.get("arguments") or "{}"
+        try:
+            args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+            if not isinstance(args, dict):
+                args = {}
+        except json.JSONDecodeError:
+            args = {}  # 参数解析失败兜底，让模型自我修正
+        return await MCPClientManager.call_tool(name, args)
 
     @classmethod
     def _headers(cls) -> dict[str, str]:
@@ -301,8 +406,8 @@ class OpenAIManager:
         return cls._base_url.rstrip("/") + "/chat/completions"
 
     @classmethod
-    def _build_messages(cls, history: list[dict[str, str]], text: str) -> list[dict[str, str]]:
-        messages: list[dict[str, str]] = []
+    def _build_messages(cls, history: list[dict[str, Any]], text: str) -> list[dict[str, Any]]:
+        messages: list[dict[str, Any]] = []
         if cls._system_prompt:
             messages.append({"role": "system", "content": cls._system_prompt})
         messages.extend(history[-cls._history_max_messages :] if cls._history_max_messages else [])
@@ -310,7 +415,7 @@ class OpenAIManager:
         return messages
 
     @classmethod
-    def _append_history(cls, history: list[dict[str, str]], text: str, response_text: str):
+    def _append_history(cls, history: list[dict[str, Any]], text: str, response_text: str):
         if cls._history_max_messages <= 0:
             return
         history.extend(
