@@ -22,6 +22,7 @@ if sys.platform in ("darwin", "linux"):
     except ImportError:
         pass
 
+from core.utils.config import ConfigManager
 from core.utils.config_loader import ensure_config_module_loaded
 
 config_path = ensure_config_module_loaded()
@@ -35,17 +36,26 @@ main_app_instance = None
 # 启动配置（从环境变量读取）
 connect_xiaozhi = False  # 是否连接小智 AI
 enable_api_server = False  # 是否开启 API Server
+enable_mcp_server = False  # 是否开启 MCP Server
 
 
 def setup_config():
     """解析命令行参数和环境变量"""
-    global connect_xiaozhi, enable_api_server, enable_xiaozhi, enable_openclaw, enable_openai, enable_qwenpaw
+    global connect_xiaozhi, enable_api_server, enable_xiaozhi, enable_openclaw, enable_openai, enable_qwenpaw, enable_mcp_server
 
     parser = argparse.ArgumentParser(description="小爱音箱接入 Open XiaoAI")
     parser.parse_args()
 
     # 从环境变量读取配置
     enable_api_server = os.environ.get("API_SERVER_ENABLE", "").lower() in ("1", "true", "yes")
+    # MCP_SERVER_ENABLE 环境变量优先，未设置时读 config.py 的 mcp.enable
+    mcp_env = os.environ.get("MCP_SERVER_ENABLE")
+    if mcp_env is not None:
+        enable_mcp_server = mcp_env.lower() in ("1", "true", "yes")
+    else:
+        enable_mcp_server = bool(
+            ConfigManager.instance().get_app_config("mcp.enable", False)
+        )
     enable_xiaozhi = os.environ.get("XIAOZHI_ENABLE", "").lower() in ("1", "true", "yes")
     # 兼容 OPENCLAW_ENABLE (新) 和 OPENCLAW_ENABLED (旧)
     openclaw_env = os.environ.get("OPENCLAW_ENABLE") or os.environ.get("OPENCLAW_ENABLED") or ""
@@ -69,6 +79,8 @@ def setup_config():
                 f"OPENCLAW_ENABLE={os.environ.get('OPENCLAW_ENABLE') or os.environ.get('OPENCLAW_ENABLED') or 'not set (disabled)'}, "
                 f"OPENAI_ENABLE={os.environ.get('OPENAI_ENABLE') or 'not set (disabled)'}, "
                 f"QWENPAW_ENABLE={os.environ.get('QWENPAW_ENABLE') or 'not set (disabled)'}, "
+                f"MCP_SERVER_ENABLE={os.environ.get('MCP_SERVER_ENABLE') or 'not set (disabled)'}, "
+                f"MCP_TRANSPORT={os.environ.get('MCP_TRANSPORT') or 'not set (default: http,sse)'}, "
                 f"AUDIO_INPUT_ENABLE={1 if audio_input_enabled else 0}")
     logger.info(f"[Main] Using config file: {config_path}")
 
@@ -95,6 +107,10 @@ def setup_config():
         f"API Server: {'启用' if enable_api_server else '禁用'}",
         module="Main",
     )
+    logger.info(
+        f"MCP Server: {'启用' if enable_mcp_server else '禁用'}",
+        module="Main",
+    )
 
 
 def run_services(xiaozhi_mode: bool = False):
@@ -103,7 +119,7 @@ def run_services(xiaozhi_mode: bool = False):
     Args:
         xiaozhi_mode: 是否启动小智 AI 完整服务（包括 VAD/KWS/GUI）
     """
-    global main_app_instance, enable_api_server, enable_openclaw, enable_openai, enable_qwenpaw
+    global main_app_instance, enable_api_server, enable_openclaw, enable_openai, enable_qwenpaw, enable_mcp_server
 
     # 统一使用 MainApp 管理所有服务
     main_app_instance = MainApp.instance(
@@ -111,8 +127,12 @@ def run_services(xiaozhi_mode: bool = False):
         enable_openclaw=enable_openclaw,
         enable_openai=enable_openai,
         enable_qwenpaw=enable_qwenpaw,
+        enable_mcp_server=enable_mcp_server,
     )
-    main_app_instance.run(enable_api_server=enable_api_server)
+    main_app_instance.run(
+        enable_api_server=enable_api_server,
+        enable_mcp_server=enable_mcp_server,
+    )
 
     # 主线程保持运行
     try:

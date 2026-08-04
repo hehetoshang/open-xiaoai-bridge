@@ -5,10 +5,15 @@ services:
     ports:
       - "4399:4399"
       - "9092:9092"
+      - "9093:9093" # MCP Server 端口（启用 MCP 时需要）
     environment:
       - LOGLEVEL=INFO # 日志级别（DEBUG, INFO, WARNING, ERROR, CRITICAL）
       - API_SERVER_ENABLE=1 # 启用 HTTP API 服务（可选）
       - API_SERVER_HOST=0.0.0.0 # HTTP API 服务监听地址（默认监听 127.0.0.1）
+      # - MCP_SERVER_ENABLE=1 # 启用 MCP Server（可选）
+      # - MCP_SERVER_HOST=0.0.0.0 # MCP 监听地址（容器内必须 0.0.0.0 才能外部访问）
+      # - MCP_SERVER_PORT=9093 # MCP 监听端口（默认 9093）
+      # - MCP_TRANSPORT=http,sse # MCP 传输方式：stdio / http / sse（逗号分隔，默认 http,sse）
       - OPENCLAW_ENABLE=1       # 启用 OpenClaw（兼容旧值 OPENCLAW_ENABLED）
       # - QWENPAW_ENABLE=1       # 启用 QwenPaw（可选）
       # - XIAOZHI_ENABLE=1       # 启用小智 AI（可选）

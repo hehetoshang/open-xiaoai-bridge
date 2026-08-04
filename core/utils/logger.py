@@ -59,7 +59,13 @@ class XiaozhiLogger:
         self.logger.setLevel(numeric_level)
         
         # 创建控制台处理器
-        console_handler = logging.StreamHandler(sys.stdout)
+        # MCP stdio 模式下 stdout 属于 MCP 协议帧，日志必须走 stderr
+        log_stream = (
+            sys.stderr
+            if os.environ.get("MCP_TRANSPORT", "").count("stdio") > 0
+            else sys.stdout
+        )
+        console_handler = logging.StreamHandler(log_stream)
         console_handler.setLevel(numeric_level)
         
         # 创建格式化器
@@ -147,3 +153,10 @@ class XiaozhiLogger:
 
 # 创建全局日志实例
 logger = XiaozhiLogger()
+
+
+def set_log_stream(stream) -> None:
+    """切换日志输出流；MCP stdio 模式下切到 stderr，避免污染 MCP 协议帧"""
+    for handler in logger.logger.handlers:
+        if hasattr(handler, "setStream"):
+            handler.setStream(stream)

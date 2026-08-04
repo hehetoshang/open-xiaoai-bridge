@@ -8,6 +8,7 @@ dependencies = [
     "asyncio>=3.4.3",
     "cryptography>=46.0.5",
     "maturin>=1.8.3",
+    "mcp>=1.29,<2",
     "numpy>=2.2.3",
     "onnxruntime==1.23.2",
     "pyaudio>=0.2.14",
@@ -28,6 +29,10 @@ build-backend = "maturin"
 [tool.maturin]
 features = ["pyo3/extension-module"]
 manifest-path = "native/Cargo.toml"
+
+[[tool.uv.index]]
+url = "https://mirrors.ustc.edu.cn/pypi/simple"
+default = true
 
 [tool.uv]
 # Rebuild package when any rust files change

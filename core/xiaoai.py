@@ -1,4 +1,6 @@
 import asyncio
+import os
+import sys
 import threading
 import time
 
@@ -308,7 +310,11 @@ class XiaoAI:
         open_xiaoai_server.register_fn("on_event", cls.__on_event)
         cls.__init_background_event_loop()
         logger.info("[XiaoAI] 启动小爱音箱服务...")
-        print(ASCII_BANNER)
+        # MCP stdio 模式下 stdout 属于 MCP 协议帧，banner 必须写 stderr
+        if os.environ.get("MCP_TRANSPORT", "").count("stdio") > 0:
+            sys.stderr.write(ASCII_BANNER + "\n")
+        else:
+            print(ASCII_BANNER)
         await open_xiaoai_server.start_server()
 
     @classmethod

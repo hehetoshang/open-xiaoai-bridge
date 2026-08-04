@@ -26,7 +26,10 @@ from core.services.protocols.typing import (
 from core.openclaw import OpenClawManager
 from core.openai import OpenAIManager
 from core.qwenpaw import QwenPawManager
+from core.mcp_client import MCPClientManager
 from core.services.api_server import APIServer
+from core.services.mcp_server import MCPServer
+from core.services.stream_player import StreamPlayer
 
 
 class MainApp:
@@ -41,6 +44,7 @@ class MainApp:
         enable_openclaw: bool = False,
         enable_openai: bool = False,
         enable_qwenpaw: bool = False,
+        enable_mcp_server: bool = False,
     ):
         """Get singleton instance.
 
@@ -48,6 +52,7 @@ class MainApp:
             enable_xiaozhi: Whether to enable XiaoZhi AI connection (default: True)
             enable_openclaw: Whether to enable OpenClaw connection (default: False)
             enable_qwenpaw: Whether to enable QwenPaw connection (default: False)
+            enable_mcp_server: Whether to enable MCP Server (default: False)
         """
         if cls._instance is None:
             cls._instance = MainApp(
@@ -55,6 +60,7 @@ class MainApp:
                 enable_openclaw=enable_openclaw,
                 enable_openai=enable_openai,
                 enable_qwenpaw=enable_qwenpaw,
+                enable_mcp_server=enable_mcp_server,
             )
         return cls._instance
 
@@ -64,6 +70,7 @@ class MainApp:
         enable_openclaw: bool = False,
         enable_openai: bool = False,
         enable_qwenpaw: bool = False,
+        enable_mcp_server: bool = False,
     ):
         """Initialize the main application.
 
@@ -71,6 +78,7 @@ class MainApp:
             enable_xiaozhi: Whether to enable XiaoZhi AI connection
             enable_openclaw: Whether to enable OpenClaw connection
             enable_qwenpaw: Whether to enable QwenPaw connection
+            enable_mcp_server: Whether to enable MCP Server
         """
         if MainApp._instance is not None:
             raise Exception("MainApp is singleton, use instance() to get instance")
@@ -84,6 +92,7 @@ class MainApp:
         self._enable_openclaw = enable_openclaw
         self._enable_openai = enable_openai
         self._enable_qwenpaw = enable_qwenpaw
+        self._enable_mcp_server = enable_mcp_server
 
         # Device state
         self.device_state = DeviceState.IDLE
@@ -114,6 +123,12 @@ class MainApp:
         self.api_server = None
         self._enable_api_server = False
 
+        # MCP Server
+        self.mcp_server = None
+
+        # StreamPlayer（中转推流播放器）
+        self.stream_player = None
+
         set_app(self)
 
     @property
@@ -123,13 +138,15 @@ class MainApp:
             return self.xiaozhi.protocol
         return None
 
-    def run(self, enable_api_server: bool = False):
+    def run(self, enable_api_server: bool = False, enable_mcp_server: bool = False):
         """Start the main application.
 
         Args:
             enable_api_server: Whether to start the HTTP API Server
+            enable_mcp_server: Whether to start the MCP Server
         """
         self._enable_api_server = enable_api_server
+        self._enable_mcp_server = enable_mcp_server
 
         # Check audio input status
         audio_input_enabled = os.environ.get(
@@ -181,6 +198,9 @@ class MainApp:
         # Initialize XiaoAI service
         asyncio.run_coroutine_threadsafe(XiaoAI.init_xiaoai(), self.loop)
 
+        # StreamPlayer（中转推流播放器，注册到 ref）
+        self.stream_player = StreamPlayer()
+
         if self._enable_xiaozhi:
             # Create XiaoZhi instance
             self.xiaozhi = XiaoZhi.instance()
@@ -197,6 +217,10 @@ class MainApp:
         if self._enable_openai:
             OpenAIManager.initialize_from_config()
             asyncio.run_coroutine_threadsafe(OpenAIManager.connect(), self.loop)
+            # MCP 外部工具（function calling）：openai.use_mcp_tools=True 时连接 mcp_servers
+            if OpenAIManager.uses_mcp_tools():
+                MCPClientManager.initialize_from_config()
+                asyncio.run_coroutine_threadsafe(MCPClientManager.start(), self.loop)
         if self._enable_qwenpaw:
             QwenPawManager.initialize_from_config()
             asyncio.run_coroutine_threadsafe(QwenPawManager.connect(), self.loop)
@@ -207,6 +231,28 @@ class MainApp:
             port = int(os.environ.get("API_SERVER_PORT", 9092))
             self.api_server = APIServer(host=host, port=port)
             asyncio.run_coroutine_threadsafe(self.api_server.start(), self.loop)
+
+        # Start MCP Server if enabled
+        # 配置优先级：环境变量 > config.py 的 mcp 段 > 默认值
+        if self._enable_mcp_server:
+            mcp_config = self.config.get_app_config("mcp", {})
+            host = os.environ.get("MCP_SERVER_HOST") or mcp_config.get("host") or "127.0.0.1"
+            port = int(os.environ.get("MCP_SERVER_PORT") or mcp_config.get("port") or 9093)
+            transport_env = os.environ.get("MCP_TRANSPORT")
+            if transport_env is not None:
+                transports = [
+                    t.strip() for t in transport_env.split(",") if t.strip()
+                ]
+            else:
+                raw_transport = mcp_config.get("transport", "http,sse")
+                if isinstance(raw_transport, str):
+                    transports = [
+                        t.strip() for t in raw_transport.split(",") if t.strip()
+                    ]
+                else:
+                    transports = list(raw_transport)
+            self.mcp_server = MCPServer(host=host, port=port, transports=transports)
+            asyncio.run_coroutine_threadsafe(self.mcp_server.start(), self.loop)
 
         # Start main loop thread
         main_loop_thread = threading.Thread(target=self._main_loop)
@@ -377,6 +423,16 @@ class MainApp:
                 self.api_server.stop(), self.loop
             )
 
+        if self.mcp_server:
+            asyncio.run_coroutine_threadsafe(
+                self.mcp_server.stop(), self.loop
+            )
+
+        if self.stream_player:
+            asyncio.run_coroutine_threadsafe(
+                self.stream_player.close(), self.loop
+            )
+
         # Close OpenClaw connection if connected
         if OpenClawManager.is_connected():
             asyncio.run_coroutine_threadsafe(
@@ -386,6 +442,10 @@ class MainApp:
             asyncio.run_coroutine_threadsafe(
                 OpenAIManager.close(), self.loop
             )
+            if MCPClientManager.is_connected():
+                asyncio.run_coroutine_threadsafe(
+                    MCPClientManager.stop(), self.loop
+                )
         if QwenPawManager.is_enabled():
             asyncio.run_coroutine_threadsafe(
                 QwenPawManager.close(), self.loop

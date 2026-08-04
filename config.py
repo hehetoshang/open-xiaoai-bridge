@@ -238,7 +238,7 @@ APP_CONFIG = {
         "OTA_URL": "http://127.0.0.1:8003/xiaozhi/ota/",
         "WEBSOCKET_URL": "ws://127.0.0.1:8000/xiaozhi/v1/",
         "WEBSOCKET_ACCESS_TOKEN": "", #（可选）一般用不到这个值
-        "DEVICE_ID": "", #（可选）默认自动生成
+        "DEVICE_ID": "28:95:29:38:cf:6a", #（可选）默认自动生成
         "VERIFICATION_CODE": "", # 首次登陆时，验证码会在这里更新
     },
     "xiaoai": {
@@ -260,6 +260,53 @@ APP_CONFIG = {
             "audio_format": "pcm",  # 推荐默认值：局域网稳定环境下首音更快、播放更顺
             "stream": True,  # 推荐默认值：边合成边播放，首音延迟更低
         }
+    },
+    # MCP (Model Context Protocol) Server Configuration
+    # 也可用环境变量覆盖：MCP_SERVER_ENABLE / MCP_SERVER_HOST / MCP_SERVER_PORT / MCP_TRANSPORT
+    "mcp": {
+        "enable": False,  # 启用 MCP Server（提供 TTS / 播放 / 设备控制工具给 AI 调用）
+        "host": "127.0.0.1",  # 监听地址（容器部署需改为 0.0.0.0）
+        "port": 9093,  # 监听端口
+        # 传输方式，逗号分隔组合：
+        #   - "stdio": Claude Desktop / Claude Code 本地连接（会占用 stdout 作为协议帧）
+        #   - "http": streamable HTTP，端点 /mcp
+        #   - "sse": SSE，端点 /sse
+        "transport": "http,sse",
+    },
+    # MCP Client Configuration：桥接服务作为 MCP 客户端连接外部 MCP server，
+    # 把外部工具暴露给 OpenAI 兼容后端的 function calling（需 openai.use_mcp_tools = True）
+    # 每个 key 即 server 名称（工具名冲突时用作前缀命名空间，建议英文小写）
+    "mcp_servers": {
+        # "weather": {
+        #     "type": "http",           # "http"（streamable HTTP）/ "sse" / "stdio"
+        #     "url": "http://127.0.0.1:9001/mcp",  # http/sse 必填
+        #     "enabled": True,          # False 时跳过该 server
+        #     "headers": {},            # 可选：额外 HTTP 头（鉴权等），http/sse 生效
+        #     "timeout": 120,           # 会话读超时 / 单次工具调用超时（秒）；长耗时工具调大
+        # },
+        # "local_tools": {
+        #     "type": "stdio",          # stdio 子进程方式（如 uvx 启动的 MCP server）
+        #     "command": "python",      # stdio 必填
+        #     "args": ["-m", "my_mcp_server"],
+        #     "env": {},                # 可选：子进程环境变量
+        #     "cwd": None,              # 可选：子进程工作目录
+        #     "enabled": True,
+        #     "timeout": 120,
+        # },
+        # neteasecli 音乐插件（网易云音乐 CLI 的 MCP server 模式）：
+        # 音箱语音对话时 AI 可搜索/播放/控制网易云音乐（经 bridge 中转推流播放）。
+        # 需要先在 neteasecli 项目目录执行 npm install && npm run build
+        # "neteasecli": {
+        #     "type": "stdio",
+        #     "command": "node",        # 或 npx neteasecli
+        #     "args": ["C:/path/to/neteasecli/dist/index.js", "mcp"],
+        #     "env": {
+        #         "NETEASECLI_PLAYER": "xiaoai",   # 播放后端：小爱音箱
+        #         "OPENXIAOAI_BASE_URL": "http://127.0.0.1:9092",  # bridge API 地址
+        #     },
+        #     "enabled": False,
+        #     "timeout": 120,
+        # },
     },
     # OpenClaw Configuration
     "openclaw": {
@@ -327,6 +374,11 @@ APP_CONFIG = {
         "rule_prompt": "注意：将结果处理成纯文字版，不要返回任何 markdown 格式，也不要包含任何代码块，并将字数控制在300字以内",
         "rule_prompt_for_skill": "注意：这条消息是主人通过小爱音箱发送的，他看不到你回复的文字。字数控制在300字以内",
         "extra_body": {},
+        # MCP 外部工具（function calling）：True 时把 config.py 的 mcp_servers 段
+        # 配置的外部 MCP 工具注入对话，模型可调用（如查天气、控制智能家居）
+        "use_mcp_tools": False,
+        # 单次对话中模型工具调用循环上限（防死循环/费用失控）
+        "max_tool_rounds": 5,
     },
     # QwenPaw Configuration
     # 需先启动 QwenPaw: qwenpaw app

@@ -111,9 +111,13 @@ OPEN_XIAOAI_TOKEN=your-secret-token API_SERVER_ENABLE=1 ./scripts/start.sh
 | `OPENAI_ENABLE` | 启用 OpenAI 兼容服务 | 禁用        |
 | `QWENPAW_ENABLE` | 启用 QwenPaw | 禁用        |
 | `API_SERVER_ENABLE`  | 启用 HTTP API | 禁用            |
+| `MCP_SERVER_ENABLE`  | 启用 MCP Server（也可在 config.py 的 `mcp` 段配置） | 禁用           |
 | `AUDIO_INPUT_ENABLE` | 启用音频输入（关闭后小智/KWS/local\_asr不可用） | 启用            |
 | `API_SERVER_HOST`    | API 监听地址    | `127.0.0.1`   |
 | `API_SERVER_PORT`    | API 监听端口    | `9092`        |
+| `MCP_SERVER_HOST`    | MCP 监听地址（也可在 config.py 的 `mcp` 段配置） | `127.0.0.1`   |
+| `MCP_SERVER_PORT`    | MCP 监听端口（也可在 config.py 的 `mcp` 段配置） | `9093`        |
+| `MCP_TRANSPORT`      | MCP 传输方式（`stdio`/`http`/`sse`，逗号分隔组合，也可在 config.py 的 `mcp` 段配置） | `http,sse`     |
 | `OPEN_XIAOAI_TOKEN`  | Client 鉴权 token，设置后仅持有相同 token 的 Client 才能连接 | 不鉴权 |
 | `CONFIG_PATH`        | 自定义配置文件路径   | `./config.py` |
 | `LOGLEVEL`           | 日志级别        | `INFO`        |
@@ -313,6 +317,14 @@ curl POST /api/play/text → API Server → SpeakerManager → 小爱音箱
 | `GET`  | `/api/tts/doubao_voices` | 获取可用音色列表     |
 | `POST` | `/api/wakeup`            | 唤醒小爱音箱       |
 | `POST` | `/api/interrupt`         | 打断当前播放       |
+| `POST` | `/api/play/pause`        | 暂停媒体播放（mediaplayer） |
+| `POST` | `/api/play/resume`       | 恢复媒体播放       |
+| `POST` | `/api/stream/play`       | 中转推流播放 URL（下载→解码→推流，支持暂停/恢复/seek） |
+| `POST` | `/api/stream/pause`      | 暂停中转播放（可恢复） |
+| `POST` | `/api/stream/resume`     | 恢复中转播放       |
+| `POST` | `/api/stream/seek`       | 跳转中转播放进度（position_ms） |
+| `POST` | `/api/stream/stop`       | 停止中转播放       |
+| `GET`  | `/api/stream/status`     | 中转播放状态（state/position/duration/loop） |
 | `GET`  | `/api/status`            | 获取播放状态       |
 | `GET`  | `/api/health`            | 健康检查         |
 
@@ -341,6 +353,110 @@ curl -X POST http://localhost:9092/api/tts/doubao \
 # 打断播放
 curl -X POST http://localhost:9092/api/interrupt
 ```
+
+***
+
+## 🔌 MCP Server
+
+设置 `MCP_SERVER_ENABLE=1` 启用（也可在 config.py 的 `mcp` 段配置，环境变量优先），提供 [Model Context Protocol](https://modelcontextprotocol.io) 服务，让 AI（Claude Desktop、Claude Code、OpenClaw 等）通过标准 MCP 协议直接调用音箱能力。
+
+支持三种传输方式（`MCP_TRANSPORT` 环境变量或 config.py `mcp.transport`，逗号分隔组合，默认 `http,sse`）：
+
+```python
+# config.py 的 APP_CONFIG 中
+"mcp": {
+    "enable": True,          # 启用 MCP Server
+    "host": "127.0.0.1",     # 监听地址（容器部署需 0.0.0.0）
+    "port": 9093,            # 监听端口
+    "transport": "http,sse", # stdio / http / sse，逗号分隔组合
+},
+```
+
+| 传输方式 | 端点 | 适用场景 |
+| ------ | ------ | ------ |
+| `stdio` | 标准输入输出 | Claude Desktop / Claude Code 本地连接 |
+| `sse` | `http://<host>:9093/sse` | 远程 SSE 客户端 |
+| `http` | `http://<host>:9093/mcp` | streamable HTTP 客户端（MCP Inspector） |
+
+### 🛠️ 可用工具
+
+| 工具 | 说明 |
+| ------ | ------ |
+| `tts_play` | 豆包 TTS 合成并直接播放（支持音色/情感/语速），凭证缺失自动回退小爱原生 TTS |
+| `tts_synthesize` | 豆包 TTS 合成并返回 base64 音频数据（不在音箱播放） |
+| `list_voices` | 查询豆包 TTS 可用音色列表 |
+| `play_text` | 小爱音箱系统原生 TTS 播报文字 |
+| `play_url` | 播放网络音频 URL |
+| `play_file` | 播放服务端本地音频文件 |
+| `get_status` | 查询播放状态 |
+| `interrupt` | 打断当前播放并停止连续对话 |
+| `wakeup` | 唤醒小爱音箱 |
+| `pause` / `resume` | 暂停/恢复媒体播放（mediaplayer） |
+| `stream_play` | 中转推流播放 URL（支持自定义请求头防防盗链、起始位置、单曲循环） |
+| `stream_pause` / `stream_resume` | 暂停/恢复中转播放（可续播） |
+| `stream_seek` | 跳转中转播放进度（position_ms） |
+| `stream_stop` / `stream_status` | 停止/查询中转播放 |
+
+### 💡 使用示例
+
+```bash
+# 启用 MCP Server（streamable HTTP + SSE）
+MCP_SERVER_ENABLE=1 uv run main.py
+
+# 仅 stdio（供 Claude Desktop / Claude Code 连接）
+MCP_SERVER_ENABLE=1 MCP_TRANSPORT=stdio uv run main.py
+```
+
+**Claude Desktop 配置**（`claude_desktop_config.json`）：
+
+```json
+{
+  "mcpServers": {
+    "open-xiaoai-bridge": {
+      "command": "uv",
+      "args": ["--directory", "C:/path/to/open-xiaoai-bridge", "run", "main.py"],
+      "env": {
+        "MCP_SERVER_ENABLE": "1",
+        "MCP_TRANSPORT": "stdio"
+      }
+    }
+  }
+}
+```
+
+**测试**（[MCP Inspector](https://github.com/modelcontextprotocol/inspector)）：
+
+```bash
+npx @modelcontextprotocol/inspector
+# Transport Type: Streamable HTTP, URL: http://127.0.0.1:9093/mcp
+# 或 Transport Type: SSE, URL: http://127.0.0.1:9093/sse
+```
+
+> **⚠️ 注意**：`stdio` 模式会占用进程的 stdout 作为 MCP 协议帧，日志自动切换到 stderr；不要在 stdio 模式下把日志重定向到 stdout。Docker 容器内使用需设置 `MCP_SERVER_HOST=0.0.0.0` 并映射端口 `9093`。
+
+### 🤝 MCP Client（连接外部 MCP server）
+
+桥接服务也可以作为 MCP **客户端**，连接多个外部 MCP server（类似 Claude Desktop 的 mcpServers 配置），把外部工具注入 **OpenAI 兼容后端**的对话（function calling）：
+
+```python
+# config.py
+"mcp_servers": {
+    "weather": {  # key 即 server 名称（工具名冲突时用作前缀）
+        "type": "http",                      # http（streamable HTTP）/ sse / stdio
+        "url": "http://127.0.0.1:9001/mcp",  # http/sse 必填
+        "enabled": True,
+        "headers": {},                        # 可选：鉴权头
+        "timeout": 120,                       # 会话/工具调用超时（秒）
+    },
+},
+"openai": {
+    ...
+    "use_mcp_tools": True,   # 启用外部 MCP 工具（需同时配置 mcp_servers）
+    "max_tool_rounds": 5,    # 工具调用循环上限
+},
+```
+
+启动：`OPENAI_ENABLE=1 uv run main.py`。对话时模型可调用外部工具（如查天气），工具结果由音箱 TTS 播报。
 
 ***
 
