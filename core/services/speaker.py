@@ -59,6 +59,13 @@ class SpeakerManager:
             timeout: 超时时长（毫秒），默认10分钟
             blocking: 是否阻塞运行
         """
+        # 打断中转推流播放（PCM 通道），保证同一时刻只有一路声音
+        from core.ref import get_stream_player
+
+        stream_player = get_stream_player()
+        if stream_player:
+            await stream_player.stop()
+
         if server_file is not None:
             return await self.play_server_file(
                 file_path=server_file,

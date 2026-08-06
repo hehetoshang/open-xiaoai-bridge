@@ -498,6 +498,13 @@ class OpenAIManager:
                     await speaker.play(text=text, blocking=True)
                 return
 
+            # 打断中转推流播放（AI 回复优先，避免与播歌/听书混音）
+            from core.ref import get_stream_player
+
+            stream_player = get_stream_player()
+            if stream_player:
+                await stream_player.stop()
+
             speaker_id = resolved_tts_speaker or tts_config.get(
                 "default_speaker", "zh_female_xiaohe_uranus_bigtts"
             )

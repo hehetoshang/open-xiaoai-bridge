@@ -118,6 +118,10 @@ class StreamPlayerTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         EXT.sent.clear()
         EXT.stop_calls = 0
+        # 清掉可能被其他测试设置的 speaker 桩，避免污染
+        from core.ref import set_speaker
+
+        set_speaker(None)
         self.sp = self.sp_mod.StreamPlayer()
 
     async def asyncTearDown(self):
@@ -199,6 +203,46 @@ class StreamPlayerTest(unittest.IsolatedAsyncioTestCase):
         await self.sp.play("http://example.com/song.mp3", start_ms=500)
         expected_offset = int(500 / 1000 * 48000)
         self.assertGreaterEqual(self.sp.offset, expected_offset - 480)
+
+    async def test_play_interrupts_device_audio(self):
+        """新播放请求打断设备其他通道（stop_device_audio 被调用）"""
+        from core.ref import set_speaker
+
+        calls = []
+
+        class FakeSpeaker:
+            async def stop_device_audio(self):
+                calls.append("stop_device_audio")
+
+        set_speaker(FakeSpeaker())
+        await self.sp.play("http://example.com/song.mp3")
+        self.assertIn("stop_device_audio", calls)
+        self.assertEqual(self.sp.state, "playing")
+
+    async def test_speaker_play_interrupts_stream_player(self):
+        """SpeakerManager.play 打断中转推流（stream_player.stop 被调用）"""
+        from core.ref import set_stream_player
+
+        stopped = []
+
+        class FakeStreamPlayer:
+            async def stop(self):
+                stopped.append("stop")
+
+        set_stream_player(FakeStreamPlayer())
+
+        from core.services.speaker import CommandResult, SpeakerManager
+
+        sm = SpeakerManager()
+        sm.run_shell = self._fake_run_shell
+
+        await sm.play(text="你好")
+        self.assertIn("stop", stopped)
+
+    async def _fake_run_shell(self, script, timeout=0):
+        from core.services.speaker import CommandResult
+
+        return CommandResult(stdout='"code": 0', stderr="", exit_code=0)
 
 
 if __name__ == "__main__":

@@ -95,8 +95,14 @@ class StreamPlayer:
         start_ms: int = 0,
         loop: bool = False,
     ) -> dict:
-        """下载并播放音频 URL（替换当前播放）"""
+        """下载并播放音频 URL（替换当前播放，并打断其他播放通道）"""
         await self.stop()
+        # 打断设备其他播放通道（mediaplayer / TTS），保证同一时刻只有一路声音
+        from core.ref import get_speaker
+
+        speaker = get_speaker()
+        if speaker:
+            await speaker.stop_device_audio()
         logger.info(
             f"[StreamPlayer] play url={url[:100]}, start_ms={start_ms}, loop={loop}",
             module="StreamPlayer",
