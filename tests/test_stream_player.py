@@ -1,6 +1,7 @@
 """StreamPlayer（中转推流播放器）单元测试（桩模式，无需音箱）"""
 
 import asyncio
+import os
 import sys
 import types
 import unittest
@@ -28,7 +29,8 @@ class FakeExt:
 
     async def on_output_data(self, data):
         self.sent.extend(data)
-        await asyncio.sleep(0)  # 让出控制权
+        # Rust 端会按设备缓冲节流；桩也保留极短节流，避免整首歌在一个调度片内送完。
+        await asyncio.sleep(0.001)
 
     async def stop_playing(self):
         self.stop_calls += 1
@@ -116,6 +118,7 @@ class StreamPlayerTest(unittest.IsolatedAsyncioTestCase):
         cls.ext = EXT
 
     async def asyncSetUp(self):
+        os.environ["STREAM_PLAYER_ALLOW_PRIVATE_URLS"] = "1"
         EXT.sent.clear()
         EXT.stop_calls = 0
         # 清掉可能被其他测试设置的 speaker 桩，避免污染
@@ -126,6 +129,7 @@ class StreamPlayerTest(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         await self.sp.close()
+        os.environ.pop("STREAM_PLAYER_ALLOW_PRIVATE_URLS", None)
 
     async def test_play_decodes_and_pumps(self):
         status = await self.sp.play("http://example.com/song.mp3")
@@ -218,6 +222,13 @@ class StreamPlayerTest(unittest.IsolatedAsyncioTestCase):
         await self.sp.play("http://example.com/song.mp3")
         self.assertIn("stop_device_audio", calls)
         self.assertEqual(self.sp.state, "playing")
+
+    async def test_stream_url_rejects_private_network_and_unsupported_scheme(self):
+        os.environ.pop("STREAM_PLAYER_ALLOW_PRIVATE_URLS", None)
+        with self.assertRaisesRegex(ValueError, "http/https"):
+            await self.sp_mod._validate_stream_url("file:///etc/passwd")
+        with self.assertRaisesRegex(ValueError, "私有网络"):
+            await self.sp_mod._validate_stream_url("http://127.0.0.1/audio.mp3")
 
     async def test_speaker_play_interrupts_stream_player(self):
         """SpeakerManager.play 打断中转推流（stream_player.stop 被调用）"""

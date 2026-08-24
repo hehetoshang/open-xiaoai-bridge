@@ -98,8 +98,8 @@ cd open-xiaoai-bridge
 # 启动（按需设置环境变量）
 API_SERVER_ENABLE=1 XIAOZHI_ENABLE=1 OPENCLAW_ENABLE=1 OPENAI_ENABLE=1 QWENPAW_ENABLE=1 ./scripts/start.sh
 
-# 启用 Client 鉴权（需与音箱端 token 一致）
-OPEN_XIAOAI_TOKEN=your-secret-token API_SERVER_ENABLE=1 ./scripts/start.sh
+# API token 首次启动自动生成到 ~/.config/open-xiaoai-bridge/api-token
+API_SERVER_ENABLE=1 ./scripts/start.sh
 ```
 
 ### ⚙️ 环境变量
@@ -115,10 +115,15 @@ OPEN_XIAOAI_TOKEN=your-secret-token API_SERVER_ENABLE=1 ./scripts/start.sh
 | `AUDIO_INPUT_ENABLE` | 启用音频输入（关闭后小智/KWS/local\_asr不可用） | 启用            |
 | `API_SERVER_HOST`    | API 监听地址    | `127.0.0.1`   |
 | `API_SERVER_PORT`    | API 监听端口    | `9092`        |
+| `OPENXIAOAI_API_TOKEN_FILE` | API Bearer token 文件（首次启动自动生成，0600） | `~/.config/open-xiaoai-bridge/api-token` |
+| `OPENXIAOAI_API_TOKEN` | API Bearer token（优先于文件，至少 32 字符） | 未设置 |
+| `API_SERVER_TLS_CERT` / `API_SERVER_TLS_KEY` | 非 loopback API 监听必需的 TLS 证书/私钥 | 未设置 |
+| `API_SERVER_CLIENT_CA` | 可选客户端 CA；设置后启用 mTLS | 未设置 |
 | `MCP_SERVER_HOST`    | MCP 监听地址（也可在 config.py 的 `mcp` 段配置） | `127.0.0.1`   |
 | `MCP_SERVER_PORT`    | MCP 监听端口（也可在 config.py 的 `mcp` 段配置） | `9093`        |
 | `MCP_TRANSPORT`      | MCP 传输方式（`stdio`/`http`/`sse`，逗号分隔组合，也可在 config.py 的 `mcp` 段配置） | `http,sse`     |
-| `OPEN_XIAOAI_TOKEN`  | Client 鉴权 token，设置后仅持有相同 token 的 Client 才能连接 | 不鉴权 |
+| `OPEN_XIAOAI_BIND` | 原生音箱 WebSocket 监听地址 | `127.0.0.1:4399` |
+| `OPEN_XIAOAI_TOKEN`  | 原生音箱 Client 鉴权 token（远程部署必需，至少 32 字符） | loopback 下可不设置 |
 | `CONFIG_PATH`        | 自定义配置文件路径   | `./config.py` |
 | `LOGLEVEL`           | 日志级别        | `INFO`        |
 
@@ -304,7 +309,9 @@ curl POST /api/play/text → API Server → SpeakerManager → 小爱音箱
 
 ## 🔌 API Server
 
-设置 `API_SERVER_ENABLE=1` 启用，默认端口 **9092**。
+设置 `API_SERVER_ENABLE=1` 启用，默认仅监听 loopback 的 **9092** 端口。所有端点
+都要求 Bearer token；跨主机监听还强制 TLS。完整部署、轮换和 AEC 调参说明见
+[`docs/security-and-aec.md`](docs/security-and-aec.md)。
 
 ### 📡 端点列表
 
@@ -331,27 +338,34 @@ curl POST /api/play/text → API Server → SpeakerManager → 小爱音箱
 ### 💡 使用示例
 
 ```bash
+TOKEN="$(cat ~/.config/open-xiaoai-bridge/api-token)"
+
 # 播放文字
 curl -X POST http://localhost:9092/api/play/text \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"text": "你好，我是小爱同学"}'
 
 # 播放音频链接
 curl -X POST http://localhost:9092/api/play/url \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"url": "https://example.com/audio.mp3"}'
 
 # 上传音频文件
 curl -X POST http://localhost:9092/api/play/file \
+  -H "Authorization: Bearer $TOKEN" \
   -F "file=@/path/to/audio.mp3"
 
 # 豆包 TTS（可指定音色）
 curl -X POST http://localhost:9092/api/tts/doubao \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"text": "你好", "speaker_id": "zh_female_cancan_mars_bigtts"}'
 
 # 打断播放
-curl -X POST http://localhost:9092/api/interrupt
+curl -X POST http://localhost:9092/api/interrupt \
+  -H "Authorization: Bearer $TOKEN"
 ```
 
 ***

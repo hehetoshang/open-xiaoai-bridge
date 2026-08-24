@@ -8,6 +8,7 @@ import numpy as np
 import open_xiaoai_server
 
 from core.ref import get_speaker, set_xiaoai
+from core.services.audio.aec import AEC
 from core.services.audio.stream import GlobalStream
 from core.services.speaker import SpeakerManager
 from core.wakeup_session import EventManager
@@ -52,6 +53,7 @@ class XiaoAI:
             gain = 1.0
         cls._input_gain = max(1.0, min(gain, 8.0))
         cls._input_gain_enabled = cls._input_gain > 1.0
+        AEC.configure(cls.config_manager.get_app_config("audio_input.aec", {}))
         wakeup_keywords = cls.config_manager.get_app_config("wakeup.keywords", [])
         cls._external_wakeup_keywords = {
             cls._normalize_text(keyword)
@@ -111,7 +113,12 @@ class XiaoAI:
 
     @classmethod
     def on_input_data(cls, data: bytes):
-        audio_array = np.frombuffer(data, dtype=np.int16)
+        try:
+            processed = AEC.process_capture(data, sample_rate=16000, channels=1)
+        except (TypeError, ValueError) as exc:
+            logger.warning(f"AEC bypassed invalid capture frame: {exc}", module="AEC")
+            processed = data
+        audio_array = np.frombuffer(processed, dtype=np.int16)
         if cls._input_gain_enabled and audio_array.size > 0:
             boosted = audio_array.astype(np.float32) * cls._input_gain
             audio_array = np.clip(boosted, -32768, 32767).astype(np.int16)
