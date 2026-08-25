@@ -8,18 +8,26 @@
 """
 
 import asyncio
+import ipaddress
+import os
+import socket
 from typing import Any
+from urllib.parse import urlsplit
 
 import aiohttp
 import open_xiaoai_server
 
 from core.ref import set_stream_player
+from core.services.audio.aec import AEC
 from core.utils.logger import logger
 
 # 推流分块大小：24kHz * 2B * 0.06s ≈ 2880B（60ms，与 Rust 侧一致）
 CHUNK_BYTES = 2880
 # PCM 参数：16bit 单声道 24kHz
 BYTES_PER_SECOND = 48000
+MAX_DOWNLOAD_BYTES = int(
+    os.environ.get("STREAM_PLAYER_MAX_DOWNLOAD_BYTES", 128 * 1024 * 1024)
+)
 
 # 支持的音频格式（URL 扩展名 / Content-Type 映射）
 _FORMAT_BY_EXT = {
@@ -56,6 +64,35 @@ def _infer_format(url: str, content_type: str | None) -> str:
             if content_type_lower.startswith(ct):
                 return fmt
     return "mp3"  # 兜底（大多数流媒体默认 mp3）
+
+
+async def _validate_stream_url(url: str) -> None:
+    """阻止控制面被用作访问本机、内网或云元数据的 SSRF 代理。"""
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("播放 URL 仅支持 http/https")
+    if parsed.username or parsed.password:
+        raise ValueError("播放 URL 不允许嵌入凭据")
+    if os.environ.get("STREAM_PLAYER_ALLOW_PRIVATE_URLS", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return
+    loop = asyncio.get_running_loop()
+    addresses = await loop.run_in_executor(
+        None,
+        lambda: socket.getaddrinfo(
+            parsed.hostname, parsed.port or 443, type=socket.SOCK_STREAM
+        ),
+    )
+    if not addresses:
+        raise ValueError("播放 URL 主机无法解析")
+    for address in addresses:
+        ip = ipaddress.ip_address(address[4][0])
+        if not ip.is_global:
+            raise ValueError("播放 URL 不允许访问本机或私有网络地址")
 
 
 class StreamPlayer:
@@ -97,6 +134,7 @@ class StreamPlayer:
     ) -> dict:
         """下载并播放音频 URL（替换当前播放，并打断其他播放通道）"""
         await self.stop()
+        await _validate_stream_url(url)
         # 打断设备其他播放通道（mediaplayer / TTS），保证同一时刻只有一路声音
         from core.ref import get_speaker
 
@@ -104,7 +142,7 @@ class StreamPlayer:
         if speaker:
             await speaker.stop_device_audio()
         logger.info(
-            f"[StreamPlayer] play url={url[:100]}, start_ms={start_ms}, loop={loop}",
+            f"[StreamPlayer] play host={urlsplit(url).hostname}, start_ms={start_ms}, loop={loop}",
             module="StreamPlayer",
         )
 
@@ -119,6 +157,8 @@ class StreamPlayer:
             data = bytearray()
             async for chunk in resp.content:
                 data.extend(chunk)
+                if len(data) > MAX_DOWNLOAD_BYTES:
+                    raise RuntimeError("下载内容超过大小限制")
         encoded = bytes(data)
         if not encoded:
             raise RuntimeError("下载内容为空")
@@ -219,6 +259,7 @@ class StreamPlayer:
                 pass
         self._task = None
         await open_xiaoai_server.stop_playing()
+        AEC.reset()
 
     async def _pump(self) -> None:
         """推流循环：从 offset 分块发送 PCM，末尾按 loop 回绕"""
@@ -230,6 +271,7 @@ class StreamPlayer:
                         self.offset = 0
                         continue
                     break
+                AEC.feed_reference(chunk, sample_rate=24000, channels=1)
                 await open_xiaoai_server.on_output_data(chunk)
                 self.offset += len(chunk)
             if not self.loop:

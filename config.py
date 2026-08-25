@@ -206,6 +206,14 @@ APP_CONFIG = {
     "audio_input": {
         # Input gain multiplier before VAD/KWS/ASR. Use 1.0 to disable.
         "gain": 1.0,
+        "aec": {
+            # 使用实际推送到扬声器的 24kHz PCM 作为参考，在 KWS/VAD 前消除回声。
+            "enabled": True,
+            # 播放缓冲 + 声学路径固定延迟；建议用实机在 60-400ms 范围校准。
+            "delay_ms": 120,
+            # 频域 NLMS 自适应速率（0.01-0.5）；双讲/削波时自动冻结学习。
+            "adaptation_rate": 0.12,
+        },
     },
     "asr": {
         # 支持 "sense_voice"（默认）、"paraformer"、"fire_red_asr" 或 "doubao"

@@ -13,6 +13,14 @@ from typing import Any
 import open_xiaoai_server
 from aiohttp import web
 from core.ref import get_speaker, get_xiaoai
+from core.services.api_security import (
+    DEFAULT_MAX_BODY_BYTES,
+    bearer_middleware,
+    build_server_ssl_context,
+    load_or_create_token,
+    validate_stream_request,
+)
+from core.services.audio.aec import AEC
 from core.services.tts.doubao import DoubaoTTS
 from core.utils.config import ConfigManager
 from core.utils.logger import logger
@@ -21,13 +29,32 @@ from core.utils.logger import logger
 class APIServer:
     """HTTP API Server to control XiaoZhi speaker remotely"""
 
-    def __init__(self, host: str = "0.0.0.0", port: int = 8080):
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 8080,
+        *,
+        api_token: str | None = None,
+    ):
         self.host = host
         self.port = port
         self.config = ConfigManager.instance()
-        self.app = web.Application()
+        if api_token is None:
+            self.api_token, self.token_file = load_or_create_token()
+        else:
+            if len(api_token) < 32:
+                raise ValueError("api_token must contain at least 32 characters")
+            self.api_token, self.token_file = api_token, None
+        max_body = int(os.environ.get("API_SERVER_MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES))
+        if max_body < 1024 or max_body > 256 * 1024 * 1024:
+            raise ValueError("API_SERVER_MAX_BODY_BYTES must be between 1024 and 268435456")
+        self.app = web.Application(
+            middlewares=[bearer_middleware(self.api_token)],
+            client_max_size=max_body,
+        )
         self.runner = None
         self.site = None
+        self.ssl_context = None
         self._setup_routes()
 
     def _setup_routes(self):
@@ -71,11 +98,22 @@ class APIServer:
 
     async def start(self):
         """Start the HTTP server"""
+        self.ssl_context = build_server_ssl_context(self.host)
         self.runner = web.AppRunner(self.app)
         await self.runner.setup()
-        self.site = web.TCPSite(self.runner, self.host, self.port)
+        self.site = web.TCPSite(
+            self.runner,
+            self.host,
+            self.port,
+            ssl_context=self.ssl_context,
+        )
         await self.site.start()
-        logger.info(f"[APIServer] HTTP server started at http://{self.host}:{self.port}")
+        scheme = "https" if self.ssl_context else "http"
+        credential_source = str(self.token_file) if self.token_file else "environment"
+        logger.info(
+            f"[APIServer] Authenticated API started at {scheme}://{self.host}:{self.port}; "
+            f"credential source: {credential_source}"
+        )
 
     async def stop(self):
         """Stop the HTTP server"""
@@ -442,12 +480,7 @@ class APIServer:
         """
         try:
             data = await request.json()
-            url = data.get("url")
-            if not url:
-                return web.json_response(
-                    {"success": False, "error": "Missing required field: url"},
-                    status=400
-                )
+            url, headers, start_ms, loop = validate_stream_request(data)
 
             from core.ref import get_stream_player
 
@@ -460,15 +493,21 @@ class APIServer:
 
             result = await player.play(
                 url,
-                headers=data.get("headers") or None,
-                start_ms=int(data.get("start_ms", 0) or 0),
-                loop=bool(data.get("loop", False)),
+                headers=headers,
+                start_ms=start_ms,
+                loop=loop,
             )
             return web.json_response({"success": True, "data": result})
-        except Exception as e:
-            logger.error(f"[APIServer] Stream play failed: {e}")
+        except ValueError as e:
             return web.json_response(
-                {"success": False, "error": str(e)},
+                {"success": False, "error": str(e)}, status=400
+            )
+        except Exception as e:
+            logger.error(
+                f"Stream play failed: {type(e).__name__}", module="APIServer"
+            )
+            return web.json_response(
+                {"success": False, "error": "Stream playback failed"},
                 status=500
             )
 
@@ -594,7 +633,8 @@ class APIServer:
             "success": True,
             "data": {
                 "status": "healthy",
-                "speaker_ready": get_speaker() is not None
+                "speaker_ready": get_speaker() is not None,
+                "aec": AEC.snapshot(),
             }
         })
 

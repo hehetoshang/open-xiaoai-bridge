@@ -12,6 +12,7 @@ use pyo3::types::PyString;
 use pyo3::Python;
 use serde_json::json;
 use std::env;
+use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, accept_hdr_async};
 
@@ -61,7 +62,9 @@ impl AppServer {
     pub async fn connect(stream: TcpStream) -> Result<WsStream, AppError> {
         let expected_token = std::env::var("OPEN_XIAOAI_TOKEN").unwrap_or_default();
         if !expected_token.is_empty() {
-            use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+            use tokio_tungstenite::tungstenite::handshake::server::{
+                ErrorResponse, Request, Response,
+            };
             let ws_stream = accept_hdr_async(stream, move |req: &Request, response: Response| {
                 let auth = req
                     .headers()
@@ -69,10 +72,11 @@ impl AppServer {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("");
                 if auth != format!("Bearer {}", expected_token) {
-                    let error: ErrorResponse = tokio_tungstenite::tungstenite::http::Response::builder()
-                        .status(401)
-                        .body(Some("Unauthorized".to_string()))
-                        .unwrap();
+                    let error: ErrorResponse =
+                        tokio_tungstenite::tungstenite::http::Response::builder()
+                            .status(401)
+                            .body(Some("Unauthorized".to_string()))
+                            .unwrap();
                     return Err(error);
                 }
                 Ok(response)
@@ -86,7 +90,24 @@ impl AppServer {
     }
 
     pub async fn run() {
-        let addr = "0.0.0.0:4399";
+        let addr = env::var("OPEN_XIAOAI_BIND").unwrap_or_else(|_| "127.0.0.1:4399".to_string());
+        let socket_addr: SocketAddr = addr
+            .parse()
+            .unwrap_or_else(|_| panic!("[AppServer] OPEN_XIAOAI_BIND 必须是 IP:PORT: {}", addr));
+        let token = env::var("OPEN_XIAOAI_TOKEN").unwrap_or_default();
+        if !token.is_empty() && token.len() < 32 {
+            panic!("[AppServer] OPEN_XIAOAI_TOKEN 至少需要 32 个字符");
+        }
+        if !socket_addr.ip().is_loopback() {
+            if token.is_empty() {
+                panic!("[AppServer] 拒绝在非 loopback 地址启动未认证 WebSocket");
+            }
+            if env::var("OPEN_XIAOAI_ALLOW_INSECURE_WS").as_deref() != Ok("1") {
+                panic!(
+                    "[AppServer] 拒绝直接暴露明文 WebSocket；请保持 loopback 监听并通过 TLS 反向代理暴露，迁移期可显式设置 OPEN_XIAOAI_ALLOW_INSECURE_WS=1"
+                );
+            }
+        }
         let listener = TcpListener::bind(&addr)
             .await
             .expect(format!("[AppServer] ❌ 绑定地址失败: {}", &addr).as_str());
