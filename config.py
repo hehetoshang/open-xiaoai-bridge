@@ -375,6 +375,8 @@ APP_CONFIG = {
         "max_tokens": 512,
         "history_max_messages": 20,
         "response_timeout": 120,
+        # 单次 MCP 工具调用超时；应小于 response_timeout，为最终模型回复预留时间
+        "tool_timeout": 30,
         "tts_speed": 1.0,
         "tts_speaker": "xiaoai",
         "session_tts_speakers": {},

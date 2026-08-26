@@ -98,7 +98,8 @@ async def _validate_stream_url(url: str) -> None:
 class StreamPlayer:
     """中转流媒体播放器：下载 → 解码 PCM → 推流（支持暂停/恢复/seek/循环）"""
 
-    def __init__(self):
+    def __init__(self, loop: asyncio.AbstractEventLoop | None = None):
+        self._loop = loop
         self.state = "idle"  # idle / playing / paused
         self.file_path: str | None = None
         self.pcm: bytes = b""
@@ -113,10 +114,24 @@ class StreamPlayer:
 
     async def close(self) -> None:
         """释放资源（应用关闭时调用）"""
-        await self.stop()
+        await self._run_on_owner_loop(self._close())
+
+    async def _close(self) -> None:
+        await self._stop()
         if self._session:
             await self._session.close()
             self._session = None
+
+    async def _run_on_owner_loop(self, coroutine):
+        """Run mutable player state on MainApp.loop even for XiaoAI callbacks."""
+        current_loop = asyncio.get_running_loop()
+        if self._loop is None or self._loop is current_loop:
+            return await coroutine
+        if not self._loop.is_running():
+            coroutine.close()
+            raise RuntimeError("StreamPlayer owner loop is not running")
+        future = asyncio.run_coroutine_threadsafe(coroutine, self._loop)
+        return await asyncio.wrap_future(future)
 
     def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None:
@@ -133,7 +148,18 @@ class StreamPlayer:
         loop: bool = False,
     ) -> dict:
         """下载并播放音频 URL（替换当前播放，并打断其他播放通道）"""
-        await self.stop()
+        return await self._run_on_owner_loop(
+            self._play(url, headers=headers, start_ms=start_ms, loop=loop)
+        )
+
+    async def _play(
+        self,
+        url: str,
+        headers: dict[str, str] | None = None,
+        start_ms: int = 0,
+        loop: bool = False,
+    ) -> dict:
+        await self._stop()
         await _validate_stream_url(url)
         # 打断设备其他播放通道（mediaplayer / TTS），保证同一时刻只有一路声音
         from core.ref import get_speaker
@@ -183,6 +209,9 @@ class StreamPlayer:
 
     async def pause(self) -> dict:
         """暂停播放（保留位置，可 resume 续播）"""
+        return await self._run_on_owner_loop(self._pause())
+
+    async def _pause(self) -> dict:
         if self.state != "playing":
             return self.get_status()
         await self._cancel_pump()
@@ -192,6 +221,9 @@ class StreamPlayer:
 
     async def resume(self) -> dict:
         """从暂停位置恢复播放"""
+        return await self._run_on_owner_loop(self._resume())
+
+    async def _resume(self) -> dict:
         if self.state != "paused":
             return self.get_status()
         if not self.pcm:
@@ -204,6 +236,9 @@ class StreamPlayer:
 
     async def seek(self, position_ms: int) -> dict:
         """跳到指定位置（毫秒）"""
+        return await self._run_on_owner_loop(self._seek(position_ms))
+
+    async def _seek(self, position_ms: int) -> dict:
         if not self.pcm:
             raise RuntimeError("当前没有可 seek 的播放内容")
         was_playing = self.state == "playing"
@@ -219,6 +254,9 @@ class StreamPlayer:
 
     async def stop(self) -> dict:
         """停止播放并清空状态"""
+        return await self._run_on_owner_loop(self._stop())
+
+    async def _stop(self) -> dict:
         await self._cancel_pump()
         self.state = "idle"
         self.file_path = None

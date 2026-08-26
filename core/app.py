@@ -199,7 +199,7 @@ class MainApp:
         asyncio.run_coroutine_threadsafe(XiaoAI.init_xiaoai(), self.loop)
 
         # StreamPlayer（中转推流播放器，注册到 ref）
-        self.stream_player = StreamPlayer()
+        self.stream_player = StreamPlayer(loop=self.loop)
 
         if self._enable_xiaozhi:
             # Create XiaoZhi instance
