@@ -3,6 +3,7 @@
 import asyncio
 import os
 import sys
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -202,6 +203,31 @@ class StreamPlayerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["state"], "idle")
         self.assertEqual(self.sp.pcm, b"")
         self.assertEqual(self.sp.duration_ms, 0)
+
+    async def test_stop_from_foreign_loop_runs_on_owner_loop(self):
+        """XiaoAI 回调跨 loop 停止 MainApp.loop 上的 pump 不会抛错。"""
+        owner_loop = asyncio.new_event_loop()
+        owner_thread = threading.Thread(target=owner_loop.run_forever, daemon=True)
+        owner_thread.start()
+        player = self.sp_mod.StreamPlayer(loop=owner_loop)
+
+        async def start_pump():
+            player.pcm = self.pcm
+            player.state = "playing"
+            player._task = asyncio.create_task(asyncio.sleep(60))
+
+        try:
+            await asyncio.wrap_future(
+                asyncio.run_coroutine_threadsafe(start_pump(), owner_loop)
+            )
+            status = await player.stop()
+            self.assertEqual("idle", status["state"])
+            self.assertIsNone(player._task)
+        finally:
+            await player.close()
+            owner_loop.call_soon_threadsafe(owner_loop.stop)
+            owner_thread.join(timeout=2)
+            owner_loop.close()
 
     async def test_start_ms_skips_beginning(self):
         await self.sp.play("http://example.com/song.mp3", start_ms=500)

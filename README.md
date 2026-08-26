@@ -493,6 +493,8 @@ npx @modelcontextprotocol/inspector
     "temperature": 0.7,
     "max_tokens": 512,
     "history_max_messages": 20,
+    "response_timeout": 120,  # 整轮对话总等待时间（秒）
+    "tool_timeout": 30,       # 单次 MCP 工具等待时间，需小于整轮超时
     "tts_speaker": "xiaoai",
 }
 ```
@@ -519,7 +521,7 @@ if "让小黑" in text:
     return None
 ```
 
-`base_url` 可以直接填到 `/v1`，框架会自动调用 `/chat/completions`；如果你的服务已经给出完整 `/v1/chat/completions` 地址，也可以直接填写完整地址。连续对话会按 `session_key` 保存最近 `history_max_messages` 条上下文；需要隔离多个助手时，可在唤醒前调用 `app.set_openai_session_key("assistant-name")`。
+`base_url` 可以直接填到 `/v1`，框架会自动调用 `/chat/completions`；如果你的服务已经给出完整 `/v1/chat/completions` 地址，也可以直接填写完整地址。连续对话会按 `session_key` 保存最近 `history_max_messages` 条上下文；需要隔离多个助手时，可在唤醒前调用 `app.set_openai_session_key("assistant-name")`。启用 MCP 工具时，`tool_timeout` 会限制每次工具调用，超时结果会回传给模型，让模型在 `response_timeout` 到期前给出可诊断回复；整轮超时后 bridge 会取消仍在运行的请求和工具任务，避免迟到的副作用。
 
 ## 🐾 QwenPaw 集成
 

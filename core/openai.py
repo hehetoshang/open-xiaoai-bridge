@@ -6,6 +6,8 @@ including Hermes Agent API server mode.
 
 import asyncio
 import json
+import re
+import time
 import uuid
 from typing import Any
 
@@ -38,6 +40,7 @@ class OpenAIManager:
     _temperature: float | None = None
     _max_tokens: int | None = None
     _timeout = 120
+    _tool_timeout = 30.0
     _history_max_messages = 20
     _extra_body: dict[str, Any] = {}
     _tts_speaker = None
@@ -50,6 +53,7 @@ class OpenAIManager:
     _max_tool_rounds = 5
     _sessions: dict[str, list[dict[str, Any]]] = {}
     _response_events: dict[str, asyncio.Future] = {}
+    _response_tasks: dict[str, asyncio.Task] = {}
     _response_texts: dict[str, str] = {}
     _response_tts_speakers: dict[str, str | None] = {}
     last_error: str | None = None
@@ -89,6 +93,14 @@ class OpenAIManager:
         cls._session_header = str(config.get("session_header", "X-Hermes-Session-Key") or "").strip()
         cls._system_prompt = str(config.get("system_prompt", "") or "")
         cls._timeout = int(config.get("response_timeout", 120))
+        default_tool_timeout = min(30.0, max(1.0, cls._timeout / 2))
+        cls._tool_timeout = max(
+            0.1,
+            min(
+                float(config.get("tool_timeout", default_tool_timeout)),
+                max(0.1, cls._timeout - 5),
+            ),
+        )
         cls._history_max_messages = max(0, int(config.get("history_max_messages", 20)))
         cls._temperature = cls._optional_float(config.get("temperature"))
         cls._max_tokens = cls._optional_int(config.get("max_tokens"))
@@ -138,7 +150,14 @@ class OpenAIManager:
 
     @classmethod
     async def close(cls):
-        """Cancel pending response waiters."""
+        """Cancel pending chat tasks and response waiters."""
+        tasks = list(cls._response_tasks.values())
+        cls._response_tasks.clear()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         for waiter in list(cls._response_events.values()):
             if not waiter.done():
                 waiter.cancel()
@@ -224,9 +243,28 @@ class OpenAIManager:
         cls._response_events[run_id] = loop.create_future()
         cls._response_texts[run_id] = ""
         cls._response_tts_speakers[run_id] = cls.get_tts_speaker_for_session_key()
+        cls.last_error = None
         logger.user_speech(text, module=f"OpenAI({cls._session_key})")
-        asyncio.create_task(cls._run_chat_completion(run_id, text))
+        task = asyncio.create_task(cls._run_chat_completion(run_id, text))
+        cls._response_tasks[run_id] = task
+        task.add_done_callback(
+            lambda completed, tracked_run_id=run_id: cls._discard_response_task(
+                tracked_run_id, completed
+            )
+        )
         return run_id
+
+    @classmethod
+    def _discard_response_task(cls, run_id: str, completed: asyncio.Task):
+        if cls._response_tasks.get(run_id) is completed:
+            cls._response_tasks.pop(run_id, None)
+
+    @classmethod
+    async def _cancel_response_task(cls, run_id: str):
+        task = cls._response_tasks.pop(run_id, None)
+        if task and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     @classmethod
     async def _wait_response(cls, run_id: str) -> str | None:
@@ -235,10 +273,12 @@ class OpenAIManager:
             logger.warning(f"[OpenAI] No event found for run {run_id}")
             return None
         try:
-            await asyncio.wait_for(event, timeout=cls._timeout)
+            await asyncio.wait_for(asyncio.shield(event), timeout=cls._timeout)
             return cls._response_texts.pop(run_id, "") or None
         except asyncio.TimeoutError:
+            cls.last_error = f"TimeoutError: response exceeded {cls._timeout}s"
             logger.warning(f"[OpenAI] Timeout waiting for response (runId: {run_id})")
+            await cls._cancel_response_task(run_id)
             return None
         finally:
             cls._response_events.pop(run_id, None)
@@ -251,6 +291,8 @@ class OpenAIManager:
             if response_text:
                 cls._response_texts[run_id] = response_text
                 logger.ai_response(response_text, module=f"OpenAI({cls._session_key})")
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             cls.last_error = f"{type(exc).__name__}: {exc}"
             logger.error(f"[OpenAI] Chat completion failed: {cls.last_error}")
@@ -299,6 +341,8 @@ class OpenAIManager:
 
                 if not tool_calls:
                     final_text = cls._extract_response_text(body)
+                    if not final_text:
+                        raise RuntimeError(cls._empty_response_summary(body))
                     break
 
                 if _round >= cls._max_tool_rounds:
@@ -345,16 +389,65 @@ class OpenAIManager:
     @classmethod
     async def _post_chat_completion(cls, http_session, payload: dict[str, Any]) -> Any:
         """发送 chat completion 请求并返回响应 body"""
+        started = time.monotonic()
         async with http_session.post(
             cls._chat_completions_url(),
             json=payload,
             headers=cls._headers(),
         ) as response:
-            body = await response.json(content_type=None)
+            try:
+                body = await response.json(content_type=None)
+            except Exception as exc:
+                content_type = response.headers.get("Content-Type", "unknown")
+                raise RuntimeError(
+                    f"HTTP {response.status}: invalid JSON response "
+                    f"(content_type={content_type})"
+                ) from exc
+            elapsed_ms = round((time.monotonic() - started) * 1000)
+            logger.debug(
+                f"[OpenAI] Chat completion status={response.status}, "
+                f"elapsed_ms={elapsed_ms}"
+            )
             if response.status >= 400:
-                message = body.get("error", body) if isinstance(body, dict) else body
-                raise RuntimeError(f"HTTP {response.status}: {message}")
+                raise RuntimeError(
+                    f"HTTP {response.status}: {cls._error_summary(body)}"
+                )
         return body
+
+    @classmethod
+    def _error_summary(cls, body: Any) -> str:
+        """Return a bounded provider error summary without request/auth data."""
+        error = body.get("error", body) if isinstance(body, dict) else body
+        if isinstance(error, dict):
+            parts = [
+                str(error.get(key))
+                for key in ("type", "code", "message")
+                if error.get(key) not in (None, "")
+            ]
+            summary = ": ".join(parts) or "provider returned an error object"
+        elif isinstance(error, str):
+            summary = error
+        else:
+            summary = f"provider returned {type(error).__name__}"
+        summary = re.sub(r"(?i)bearer\s+[a-z0-9._~+/-]+", "Bearer <redacted>", summary)
+        summary = re.sub(
+            r"(?i)(api[_ -]?key|authorization|token)(\s*[:=]\s*)\S+",
+            r"\1\2<redacted>",
+            summary,
+        )
+        return " ".join(summary.split())[:300]
+
+    @classmethod
+    def _empty_response_summary(cls, body: Any) -> str:
+        choices = body.get("choices") if isinstance(body, dict) else None
+        first = choices[0] if isinstance(choices, list) and choices else None
+        finish_reason = first.get("finish_reason") if isinstance(first, dict) else None
+        message = first.get("message") if isinstance(first, dict) else None
+        fields = sorted(message.keys()) if isinstance(message, dict) else []
+        return (
+            "HTTP 200 response contained no non-empty completion text "
+            f"(finish_reason={finish_reason!r}, message_fields={fields})"
+        )
 
     @classmethod
     def _extract_message(cls, body: Any) -> dict | None:
@@ -384,7 +477,23 @@ class OpenAIManager:
                 args = {}
         except json.JSONDecodeError:
             args = {}  # 参数解析失败兜底，让模型自我修正
-        return await MCPClientManager.call_tool(name, args)
+        started = time.monotonic()
+        try:
+            result = await asyncio.wait_for(
+                MCPClientManager.call_tool(name, args),
+                timeout=cls._tool_timeout,
+            )
+            logger.debug(
+                f"[OpenAI] Tool completed name={name!r}, "
+                f"elapsed_ms={round((time.monotonic() - started) * 1000)}"
+            )
+            return result
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[OpenAI] Tool timed out name={name!r}, "
+                f"timeout={cls._tool_timeout:g}s"
+            )
+            return f"工具调用超时（{cls._tool_timeout:g} 秒）：{name}"
 
     @classmethod
     def _headers(cls) -> dict[str, str]:
