@@ -365,6 +365,15 @@ class OpenAIManager:
                     *(cls._run_tool_call(tc) for tc in tool_calls),
                     return_exceptions=True,
                 )
+                if any(
+                    not isinstance(result, Exception)
+                    and bool(getattr(result, "terminate_silently", False))
+                    for result in results
+                ):
+                    logger.info(
+                        "[OpenAI] Playback started; ending tool turn silently"
+                    )
+                    return None
                 for tc, result in zip(tool_calls, results):
                     messages.append(
                         {

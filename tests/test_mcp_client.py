@@ -4,6 +4,7 @@ import asyncio
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -15,7 +16,7 @@ ensure_config_module_loaded()
 
 import core.mcp_client as mcp_mod
 from core.mcp_client import MCPClientManager
-from mcp.types import Tool
+from mcp.types import TextContent, Tool
 
 # ---------- 工具：本地 FastMCP server ----------
 
@@ -197,6 +198,75 @@ class RebuildAggregateTest(unittest.TestCase):
         names = [t["function"]["name"] for t in MCPClientManager.get_tools()]
         self.assertEqual(len(names), 3)
         self.assertEqual(len(set(names)), 3)  # 全部唯一
+
+
+class ToolResultTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        MCPClientManager._name_map = {"play_track": ("music", "play_track")}
+        MCPClientManager._servers = {
+            "music": mcp_mod.MCPServerConfig(name="music", type="http")
+        }
+
+    async def _call_with(self, result=None, error=None):
+        class FakeSession:
+            async def call_tool(self, *_args, **_kwargs):
+                if error:
+                    raise error
+                return result
+
+        MCPClientManager._sessions = {"music": FakeSession()}
+        return await MCPClientManager.call_tool("play_track", {})
+
+    async def test_exact_playback_signal_is_preserved(self):
+        result = await self._call_with(
+            SimpleNamespace(
+                content=[TextContent(type="text", text="正在播放：测试歌曲")],
+                isError=False,
+                structuredContent={
+                    "x-open-xiaoai-bridge": {
+                        "version": 1,
+                        "action": "end_turn_silently",
+                        "reason": "playback_started",
+                    }
+                },
+            )
+        )
+
+        self.assertEqual(result, "正在播放：测试歌曲")
+        self.assertTrue(result.terminate_silently)
+
+    async def test_mcp_error_never_terminates_silently(self):
+        result = await self._call_with(
+            SimpleNamespace(
+                content=[TextContent(type="text", text="播放失败")],
+                isError=True,
+                structuredContent={
+                    "x-open-xiaoai-bridge": {
+                        "version": 1,
+                        "action": "end_turn_silently",
+                        "reason": "playback_started",
+                    }
+                },
+            )
+        )
+
+        self.assertIn("返回错误", result)
+        self.assertFalse(result.terminate_silently)
+
+    async def test_empty_success_is_converted_to_model_facing_error(self):
+        result = await self._call_with(
+            SimpleNamespace(content=[], isError=False, structuredContent=None)
+        )
+
+        self.assertIn("返回空结果", result)
+        self.assertFalse(result.terminate_silently)
+
+    async def test_transport_failure_is_model_facing_and_not_silent(self):
+        result = await self._call_with(error=RuntimeError("HTTP 503"))
+
+        self.assertIn("调用失败", result)
+        self.assertIn("HTTP 503", result)
+        self.assertFalse(result.terminate_silently)
 
 
 # ---------- 真实连接测试 ----------

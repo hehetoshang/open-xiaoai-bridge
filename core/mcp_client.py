@@ -32,6 +32,23 @@ _OPENAI_NAME_MAX = 64
 _PING_INTERVAL = 60
 # 重连退避上限（秒）
 _MAX_BACKOFF = 60.0
+_SILENT_TERMINATION_KEY = "x-open-xiaoai-bridge"
+_SILENT_TERMINATION_SIGNAL = {
+    "version": 1,
+    "action": "end_turn_silently",
+    "reason": "playback_started",
+}
+
+
+class MCPToolResult(str):
+    """Text for the model plus bridge-only control metadata."""
+
+    terminate_silently: bool
+
+    def __new__(cls, content: str, *, terminate_silently: bool = False):
+        value = super().__new__(cls, content)
+        value.terminate_silently = terminate_silently
+        return value
 
 
 @dataclass
@@ -301,16 +318,16 @@ class MCPClientManager:
         return cls._openai_tools
 
     @classmethod
-    async def call_tool(cls, name: str, arguments: dict[str, Any]) -> str:
+    async def call_tool(cls, name: str, arguments: dict[str, Any]) -> MCPToolResult:
         """调用外部 MCP 工具，返回文本结果；任何失败返回错误文本（不抛异常）"""
         mapping = cls._name_map.get(name)
         if not mapping:
-            return f"[MCPClient] 未知工具: {name}"
+            return MCPToolResult(f"[MCPClient] 未知工具: {name}")
         server, original = mapping
         session = cls._sessions.get(server)
         cfg = cls._servers.get(server)
         if session is None:
-            return f"[MCPClient] 工具 {name} 不可用：server {server} 未连接"
+            return MCPToolResult(f"[MCPClient] 工具 {name} 不可用：server {server} 未连接")
         try:
             result = await session.call_tool(
                 original,
@@ -318,12 +335,21 @@ class MCPClientManager:
                 read_timeout_seconds=timedelta(seconds=cfg.timeout if cfg else 120),
             )
         except Exception as exc:
-            return f"[MCPClient] 工具 {name} 调用失败: {type(exc).__name__}: {exc}"
+            return MCPToolResult(
+                f"[MCPClient] 工具 {name} 调用失败: {type(exc).__name__}: {exc}"
+            )
         if not result.content:
-            return ""
+            return MCPToolResult(f"[MCPClient] 工具 {name} 返回空结果，无法确认执行成功")
         text = "\n".join(
             c.text for c in result.content if isinstance(c, TextContent)
         )
         if result.isError:
-            return f"[MCPClient] 工具 {name} 返回错误: {text or '未知错误'}"
-        return text
+            return MCPToolResult(f"[MCPClient] 工具 {name} 返回错误: {text or '未知错误'}")
+        if not text.strip():
+            return MCPToolResult(f"[MCPClient] 工具 {name} 返回空结果，无法确认执行成功")
+        structured = getattr(result, "structuredContent", None)
+        terminate_silently = (
+            isinstance(structured, dict)
+            and structured.get(_SILENT_TERMINATION_KEY) == _SILENT_TERMINATION_SIGNAL
+        )
+        return MCPToolResult(text, terminate_silently=terminate_silently)
