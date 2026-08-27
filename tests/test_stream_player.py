@@ -7,6 +7,7 @@ import threading
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -120,6 +121,7 @@ class StreamPlayerTest(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self):
         os.environ["STREAM_PLAYER_ALLOW_PRIVATE_URLS"] = "1"
+        os.environ.pop("STREAM_PLAYER_TRUSTED_HOSTS", None)
         EXT.sent.clear()
         EXT.stop_calls = 0
         # 清掉可能被其他测试设置的 speaker 桩，避免污染
@@ -131,6 +133,7 @@ class StreamPlayerTest(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.sp.close()
         os.environ.pop("STREAM_PLAYER_ALLOW_PRIVATE_URLS", None)
+        os.environ.pop("STREAM_PLAYER_TRUSTED_HOSTS", None)
 
     async def test_play_decodes_and_pumps(self):
         status = await self.sp.play("http://example.com/song.mp3")
@@ -255,6 +258,25 @@ class StreamPlayerTest(unittest.IsolatedAsyncioTestCase):
             await self.sp_mod._validate_stream_url("file:///etc/passwd")
         with self.assertRaisesRegex(ValueError, "私有网络"):
             await self.sp_mod._validate_stream_url("http://127.0.0.1/audio.mp3")
+
+    async def test_stream_url_allows_configured_cdn_suffix_with_proxy_fake_ip(self):
+        os.environ.pop("STREAM_PLAYER_ALLOW_PRIVATE_URLS", None)
+        os.environ["STREAM_PLAYER_TRUSTED_HOSTS"] = "music.126.net"
+        fake_ip = [(2, 1, 6, "", ("198.18.0.61", 443))]
+        with patch.object(self.sp_mod.socket, "getaddrinfo", return_value=fake_ip):
+            await self.sp_mod._validate_stream_url(
+                "https://m801.music.126.net/song.mp3"
+            )
+
+    async def test_stream_url_does_not_trust_unrelated_fake_ip_host(self):
+        os.environ.pop("STREAM_PLAYER_ALLOW_PRIVATE_URLS", None)
+        os.environ["STREAM_PLAYER_TRUSTED_HOSTS"] = "music.126.net"
+        fake_ip = [(2, 1, 6, "", ("198.18.0.61", 443))]
+        with patch.object(self.sp_mod.socket, "getaddrinfo", return_value=fake_ip):
+            with self.assertRaisesRegex(ValueError, "私有网络"):
+                await self.sp_mod._validate_stream_url(
+                    "https://attacker.example/song.mp3"
+                )
 
     async def test_speaker_play_interrupts_stream_player(self):
         """SpeakerManager.play 打断中转推流（stream_player.stop 被调用）"""

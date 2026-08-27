@@ -37,8 +37,12 @@ token 放进 shell history、进程参数或镜像。
   给同网段监听者。
 
 API 还会限制请求体大小，只转发短 `User-Agent`/`Referer` 头，拒绝内嵌凭据、
-本机、私网、链路本地和云元数据目标。确需播放私网 URL 时可显式设置
-`STREAM_PLAYER_ALLOW_PRIVATE_URLS=1`，并把 API 隔离在可信网络中。
+本机、私网、链路本地和云元数据目标。透明代理可能把公网媒体 CDN 解析到
+`198.18.0.0/15` Fake-IP。此时优先使用
+`STREAM_PLAYER_TRUSTED_HOSTS=music.126.net` 这类逗号分隔的显式域名/后缀白名单；
+匹配项允许其子域名通过，但其他非公网地址仍会被拒绝。仅在整个目标网络均可信且
+无法使用域名白名单时，才设置 `STREAM_PLAYER_ALLOW_PRIVATE_URLS=1` 并把 API 隔离
+在可信网络中。
 
 ## AEC 音频链路
 
