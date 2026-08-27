@@ -12,6 +12,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from core.tool_result import ToolCallResult
+
 
 class FakeAiohttpSession:
     """aiohttp.ClientSession 桩：作为 async CM 使用"""
@@ -34,14 +36,27 @@ class FakeMCPServer:
             {"type": "function", "function": {"name": "weather", "description": "查天气", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}
         ]
         self.call_history = []
+        self.results = {}
 
     def get_tools(self):
         return self.tools
 
     async def call_tool(self, name, arguments):
         self.call_history.append((name, arguments))
+        if name in self.results:
+            return self.results[name]
         if name == "weather":
             return "北京晴天 25 度"
+        if name == "play_track":
+            return ToolCallResult(
+                text="正在播放：测试歌曲",
+                silent_end_turn=True,
+            )
+        if name == "play_failed":
+            return ToolCallResult(
+                text="[MCPClient] 工具 play_track 返回错误: 播放服务不可用",
+                is_error=True,
+            )
         if name == "slow_tool":
             await asyncio.sleep(0.05)
             return "slow result"
@@ -130,6 +145,7 @@ class OpenAIToolLoopTest(unittest.TestCase):
         result = self.run_async(self.manager._request_chat_completion("今天天气怎么样？"))
 
         self.assertEqual(result, "北京晴天 25 度")
+        self.assertFalse(self.manager.is_silent_end_turn_result(result))
 
         # 第一轮 payload 含 tools
         first_payload = self.captured_payloads[0]
@@ -191,6 +207,45 @@ class OpenAIToolLoopTest(unittest.TestCase):
             sorted(self.mcp_stub.call_history), sorted([("weather", {"city": "北京"}), ("slow_tool", {})])
         )
 
+    def test_playback_success_skips_final_model_request(self):
+        """播放成功信号立即静默终止，不再请求模型生成确认文本"""
+        self._set_sequential_responses(
+            [make_tool_call_response("play_track", {"query": "测试歌曲"})]
+        )
+
+        result = self.run_async(self.manager._request_chat_completion("播放测试歌曲"))
+
+        self.assertTrue(self.manager.is_silent_end_turn_result(result))
+        self.assertEqual(len(self.captured_payloads), 1)
+        self.assertEqual(self.mcp_stub.call_history, [("play_track", {"query": "测试歌曲"})])
+        self.assertEqual(self.manager._sessions["test-session"], [])
+
+    def test_playback_failure_still_requests_audible_reply(self):
+        """播放失败作为工具错误交给模型，保留最终可播报回复"""
+        self._set_sequential_responses(
+            [
+                make_tool_call_response("play_failed", {}),
+                make_text_response("播放失败，请稍后再试"),
+            ]
+        )
+
+        result = self.run_async(self.manager._request_chat_completion("播放测试歌曲"))
+
+        self.assertEqual(result, "播放失败，请稍后再试")
+        self.assertEqual(len(self.captured_payloads), 2)
+        self.assertIn("播放服务不可用", self.captured_payloads[1]["messages"][-1]["content"])
+
+    def test_ordinary_tool_does_not_end_turn_silently(self):
+        """普通工具维持工具结果回传与最终模型请求"""
+        self._set_sequential_responses(
+            [make_tool_call_response("weather", {"city": "北京"}), make_text_response("晴天")]
+        )
+
+        result = self.run_async(self.manager._request_chat_completion("查天气"))
+
+        self.assertEqual(result, "晴天")
+        self.assertEqual(len(self.captured_payloads), 2)
+
     def test_bad_arguments_json_falls_back_to_empty(self):
         """坏 JSON 参数兜底为 {}"""
         self._set_sequential_responses(
@@ -238,6 +293,135 @@ class OpenAIToolLoopTest(unittest.TestCase):
         self.assertEqual(result, "普通回复")
         self.assertNotIn("tools", self.captured_payloads[0])
         self.assertEqual(self.mcp_stub.call_history, [])
+
+    def test_playback_success_ends_turn_without_followup_model_call(self):
+        self.mcp_stub.results["play_track"] = ToolCallResult(
+            text="正在播放：测试歌曲",
+            silent_end_turn=True,
+        )
+        self._set_sequential_responses(
+            [make_tool_call_response("play_track", {"query": "测试歌曲"})]
+        )
+
+        result = self.run_async(self.manager._request_chat_completion("播放测试歌曲"))
+
+        self.assertTrue(self.manager.is_silent_end_turn_result(result))
+        self.assertEqual(len(self.captured_payloads), 1)
+        self.assertEqual(self.manager._sessions["test-session"], [])
+
+    def test_playback_failure_is_returned_to_model(self):
+        failure = "open-xiaoai-bridge POST /api/stream/play failed (HTTP 400): URL 被拒绝"
+        self.mcp_stub.results["play_track"] = ToolCallResult(
+            text=failure,
+            is_error=True,
+        )
+        self._set_sequential_responses(
+            [
+                make_tool_call_response("play_track", {"query": "测试歌曲"}),
+                make_text_response("播放失败：URL 被拒绝"),
+            ]
+        )
+
+        result = self.run_async(self.manager._request_chat_completion("播放测试歌曲"))
+
+        self.assertEqual(result, "播放失败：URL 被拒绝")
+        self.assertEqual(len(self.captured_payloads), 2)
+        self.assertEqual(self.captured_payloads[1]["messages"][-1]["content"], failure)
+
+    def test_reasoning_content_is_preserved_for_failure_followup(self):
+        self.mcp_stub.results["play_track"] = ToolCallResult(
+            text="播放失败：缺少歌曲参数",
+            is_error=True,
+        )
+        first = make_tool_call_response("play_track", {})
+        first["choices"][0]["message"]["reasoning_content"] = "opaque-provider-state"
+        self._set_sequential_responses(
+            [first, make_text_response("播放失败，请告诉我歌曲名称")]
+        )
+
+        result = self.run_async(self.manager._request_chat_completion("播放一首歌"))
+
+        self.assertEqual(result, "播放失败，请告诉我歌曲名称")
+        assistant_message = self.captured_payloads[1]["messages"][-2]
+        self.assertEqual(
+            assistant_message["reasoning_content"],
+            "opaque-provider-state",
+        )
+
+    def test_silent_signal_does_not_swallow_sibling_failure(self):
+        self.mcp_stub.results["play_track"] = ToolCallResult(
+            text="正在播放：测试歌曲",
+            silent_end_turn=True,
+        )
+        self.mcp_stub.results["status"] = ToolCallResult(
+            text="状态查询失败",
+            is_error=True,
+        )
+        self._set_sequential_responses(
+            [
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "play-1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "play_track",
+                                            "arguments": "{}",
+                                        },
+                                    },
+                                    {
+                                        "id": "status-1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "status",
+                                            "arguments": "{}",
+                                        },
+                                    },
+                                ],
+                            }
+                        }
+                    ]
+                },
+                make_text_response("状态查询失败，请稍后再试"),
+            ]
+        )
+
+        result = self.run_async(self.manager._request_chat_completion("播放并查询状态"))
+
+        self.assertEqual(result, "状态查询失败，请稍后再试")
+        self.assertEqual(len(self.captured_payloads), 2)
+
+    def test_send_and_play_reply_does_not_tts_silent_directive(self):
+        tts_calls = []
+
+        async def fake_send(cls, text):
+            return "run-1"
+
+        async def fake_tts(cls, text, **kwargs):
+            tts_calls.append(text)
+
+        # Use the real directive without deriving behavior from an empty string.
+        from core.openai import OpenAITurnDirective
+
+        async def fake_wait(cls, run_id):
+            return OpenAITurnDirective.SILENT_END
+
+        self.manager._send_and_track = classmethod(fake_send)
+        self.manager._wait_response = classmethod(fake_wait)
+        self.manager._play_response_with_tts = classmethod(fake_tts)
+        self.manager._response_tts_speakers = {"run-1": "xiaoai"}
+
+        result = self.run_async(
+            self.manager.send_and_play_reply("播放测试歌曲", wait_response=True)
+        )
+
+        self.assertTrue(self.manager.is_silent_end_turn_result(result))
+        self.assertEqual(tts_calls, [])
 
 
 if __name__ == "__main__":

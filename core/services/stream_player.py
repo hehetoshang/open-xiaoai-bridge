@@ -29,6 +29,30 @@ MAX_DOWNLOAD_BYTES = int(
     os.environ.get("STREAM_PLAYER_MAX_DOWNLOAD_BYTES", 128 * 1024 * 1024)
 )
 
+
+def _trusted_stream_hosts() -> set[str]:
+    """Return explicitly trusted media hosts/suffixes from the environment.
+
+    Some transparent proxies resolve public media CDNs to RFC 2544 benchmark
+    addresses (198.18.0.0/15).  Those addresses must remain blocked by default,
+    but an operator can trust a controlled CDN suffix without disabling SSRF
+    protection for every private destination.
+    """
+    return {
+        host.strip().lower().strip(".")
+        for host in os.environ.get("STREAM_PLAYER_TRUSTED_HOSTS", "").split(",")
+        if host.strip().strip(".")
+    }
+
+
+def _is_trusted_stream_host(hostname: str) -> bool:
+    normalized = hostname.lower().strip(".")
+    return any(
+        normalized == trusted or normalized.endswith(f".{trusted}")
+        for trusted in _trusted_stream_hosts()
+    )
+
+
 # 支持的音频格式（URL 扩展名 / Content-Type 映射）
 _FORMAT_BY_EXT = {
     ".mp3": "mp3",
@@ -89,9 +113,10 @@ async def _validate_stream_url(url: str) -> None:
     )
     if not addresses:
         raise ValueError("播放 URL 主机无法解析")
+    trusted_host = _is_trusted_stream_host(parsed.hostname)
     for address in addresses:
         ip = ipaddress.ip_address(address[4][0])
-        if not ip.is_global:
+        if not ip.is_global and not trusted_host:
             raise ValueError("播放 URL 不允许访问本机或私有网络地址")
 
 
