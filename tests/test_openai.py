@@ -115,7 +115,8 @@ class OpenAITimeoutTest(unittest.IsolatedAsyncioTestCase):
         with patch.dict(sys.modules, {"core.mcp_client": fake_mcp}):
             result = await self.manager._run_tool_call(tool_call)
 
-        self.assertIn("工具调用超时", result)
+        self.assertTrue(result.is_error)
+        self.assertIn("工具调用超时", result.text)
         self.assertTrue(cancelled.is_set())
 
     async def test_response_timeout_cancels_background_chat_task(self):

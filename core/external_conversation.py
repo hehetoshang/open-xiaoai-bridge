@@ -190,6 +190,12 @@ class ExternalConversationController:
                 result = await self._run_one_turn_with_xiaoai_asr()
             else:
                 result = await self._run_one_turn_with_local_asr()
+            if result == "silent_exit":
+                logger.info(
+                    "Backend requested silent end of conversation",
+                    module=self.LOG_MODULE,
+                )
+                break
             if result in ("exit", "timeout"):
                 if self.uses_xiaoai_asr():
                     await self._stop_xiaoai_native_listening()
@@ -246,6 +252,8 @@ class ExternalConversationController:
         run_id = await self.backend._send_and_track(full_text)
         await self._play_send_sound()
         response = await self.backend._wait_response(run_id) if run_id else None
+        if self._is_silent_end_turn_response(response):
+            return "silent_exit"
         if response is None:
             logger.warning(f"No response from {self.BACKEND_NAME}", module=self.LOG_MODULE)
             speaker = get_speaker()
@@ -285,6 +293,8 @@ class ExternalConversationController:
         if self.backend._rule_prompt:
             full_text = text + "\n" + self.backend._rule_prompt
         response = await self.backend.send(full_text, wait_response=True)
+        if self._is_silent_end_turn_response(response):
+            return "silent_exit"
         if response is None:
             logger.warning(f"No response from {self.BACKEND_NAME}", module=self.LOG_MODULE)
             speaker = get_speaker()
@@ -298,6 +308,11 @@ class ExternalConversationController:
         await self._start_recording()
         logger.debug("Ready for next XiaoAI native ASR round", module=self.LOG_MODULE)
         return "continue"
+
+    def _is_silent_end_turn_response(self, response: object) -> bool:
+        """Recognize an explicit backend directive without treating None as success."""
+        checker = getattr(self.backend, "is_silent_end_turn_result", None)
+        return bool(callable(checker) and checker(response))
 
     # ---- VAD integration ----
 

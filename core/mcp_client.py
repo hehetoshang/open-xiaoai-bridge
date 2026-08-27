@@ -23,6 +23,7 @@ from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
 from mcp.types import TextContent, Tool
 
+from core.tool_result import ToolCallResult
 from core.utils.config import ConfigManager
 from core.utils.logger import logger
 
@@ -32,6 +33,13 @@ _OPENAI_NAME_MAX = 64
 _PING_INTERVAL = 60
 # 重连退避上限（秒）
 _MAX_BACKOFF = 60.0
+# MCP structuredContent namespace used for bridge-only turn control.
+_BRIDGE_CONTROL_KEY = "x-open-xiaoai-bridge"
+_SILENT_PLAYBACK_SIGNAL = {
+    "version": 1,
+    "action": "end_turn_silently",
+    "reason": "playback_started",
+}
 
 
 @dataclass
@@ -301,16 +309,22 @@ class MCPClientManager:
         return cls._openai_tools
 
     @classmethod
-    async def call_tool(cls, name: str, arguments: dict[str, Any]) -> str:
-        """调用外部 MCP 工具，返回文本结果；任何失败返回错误文本（不抛异常）"""
+    async def call_tool(cls, name: str, arguments: dict[str, Any]) -> ToolCallResult:
+        """调用外部 MCP 工具并保留显式的错误/回合控制元数据。"""
         mapping = cls._name_map.get(name)
         if not mapping:
-            return f"[MCPClient] 未知工具: {name}"
+            return ToolCallResult(
+                text=f"[MCPClient] 未知工具: {name}",
+                is_error=True,
+            )
         server, original = mapping
         session = cls._sessions.get(server)
         cfg = cls._servers.get(server)
         if session is None:
-            return f"[MCPClient] 工具 {name} 不可用：server {server} 未连接"
+            return ToolCallResult(
+                text=f"[MCPClient] 工具 {name} 不可用：server {server} 未连接",
+                is_error=True,
+            )
         try:
             result = await session.call_tool(
                 original,
@@ -318,12 +332,27 @@ class MCPClientManager:
                 read_timeout_seconds=timedelta(seconds=cfg.timeout if cfg else 120),
             )
         except Exception as exc:
-            return f"[MCPClient] 工具 {name} 调用失败: {type(exc).__name__}: {exc}"
-        if not result.content:
-            return ""
+            return ToolCallResult(
+                text=f"[MCPClient] 工具 {name} 调用失败: {type(exc).__name__}: {exc}",
+                is_error=True,
+            )
         text = "\n".join(
             c.text for c in result.content if isinstance(c, TextContent)
         )
         if result.isError:
-            return f"[MCPClient] 工具 {name} 返回错误: {text or '未知错误'}"
-        return text
+            return ToolCallResult(
+                text=f"[MCPClient] 工具 {name} 返回错误: {text or '未知错误'}",
+                is_error=True,
+            )
+        if not text.strip():
+            return ToolCallResult(
+                text=f"[MCPClient] 工具 {name} 返回空结果，无法确认执行成功",
+                is_error=True,
+            )
+
+        structured = getattr(result, "structuredContent", None)
+        silent_end_turn = (
+            isinstance(structured, dict)
+            and structured.get(_BRIDGE_CONTROL_KEY) == _SILENT_PLAYBACK_SIGNAL
+        )
+        return ToolCallResult(text=text, silent_end_turn=silent_end_turn)

@@ -9,15 +9,23 @@ import json
 import re
 import time
 import uuid
+from enum import Enum
 from typing import Any
 
 import aiohttp
 
 import open_xiaoai_server
 
+from core.tool_result import ToolCallResult
 from core.utils.base import get_env
 from core.utils.config import ConfigManager
 from core.utils.logger import logger
+
+
+class OpenAITurnDirective(Enum):
+    """Non-text outcomes that control the current OpenAI conversation turn."""
+
+    SILENT_END = "silent_end"
 
 
 class OpenAIManager:
@@ -54,7 +62,7 @@ class OpenAIManager:
     _sessions: dict[str, list[dict[str, Any]]] = {}
     _response_events: dict[str, asyncio.Future] = {}
     _response_tasks: dict[str, asyncio.Task] = {}
-    _response_texts: dict[str, str] = {}
+    _response_texts: dict[str, str | OpenAITurnDirective] = {}
     _response_tts_speakers: dict[str, str | None] = {}
     last_error: str | None = None
 
@@ -182,6 +190,10 @@ class OpenAIManager:
             cls.initialize_from_config()
         return cls._use_mcp_tools
 
+    @staticmethod
+    def is_silent_end_turn_result(result: object) -> bool:
+        return result is OpenAITurnDirective.SILENT_END
+
     @classmethod
     def set_session_key(cls, session_key: str):
         logger.info(
@@ -199,7 +211,11 @@ class OpenAIManager:
         return cls._session_tts_speakers.get(target_session_key) or cls._tts_speaker
 
     @classmethod
-    async def send(cls, text: str, wait_response: bool = False) -> str | None:
+    async def send(
+        cls,
+        text: str,
+        wait_response: bool = False,
+    ) -> str | OpenAITurnDirective | None:
         run_id = await cls._send_and_track(text)
         if run_id is None:
             return None
@@ -212,7 +228,11 @@ class OpenAIManager:
             cls._response_tts_speakers.pop(run_id, None)
 
     @classmethod
-    async def send_and_play_reply(cls, text: str, wait_response: bool = False) -> str | None:
+    async def send_and_play_reply(
+        cls,
+        text: str,
+        wait_response: bool = False,
+    ) -> str | OpenAITurnDirective | None:
         run_id = await cls._send_and_track(text)
         if run_id is None:
             return None
@@ -221,7 +241,9 @@ class OpenAIManager:
             return run_id
         try:
             response_text = await cls._wait_response(run_id)
-            if response_text:
+            if cls.is_silent_end_turn_result(response_text):
+                return response_text
+            if isinstance(response_text, str) and response_text:
                 await cls._play_response_with_tts(
                     response_text,
                     tts_speaker=cls._response_tts_speakers.get(run_id),
@@ -267,7 +289,10 @@ class OpenAIManager:
             await asyncio.gather(task, return_exceptions=True)
 
     @classmethod
-    async def _wait_response(cls, run_id: str) -> str | None:
+    async def _wait_response(
+        cls,
+        run_id: str,
+    ) -> str | OpenAITurnDirective | None:
         event = cls._response_events.get(run_id)
         if not event:
             logger.warning(f"[OpenAI] No event found for run {run_id}")
@@ -287,10 +312,16 @@ class OpenAIManager:
     @classmethod
     async def _run_chat_completion(cls, run_id: str, text: str):
         try:
-            response_text = await cls._request_chat_completion(text)
-            if response_text:
-                cls._response_texts[run_id] = response_text
-                logger.ai_response(response_text, module=f"OpenAI({cls._session_key})")
+            response = await cls._request_chat_completion(text)
+            if cls.is_silent_end_turn_result(response):
+                cls._response_texts[run_id] = response
+                logger.info(
+                    "Playback started; ending OpenAI turn silently",
+                    module="OpenAI",
+                )
+            elif isinstance(response, str) and response:
+                cls._response_texts[run_id] = response
+                logger.ai_response(response, module=f"OpenAI({cls._session_key})")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -302,7 +333,10 @@ class OpenAIManager:
                 waiter.get_loop().call_soon_threadsafe(waiter.set_result, None)
 
     @classmethod
-    async def _request_chat_completion(cls, text: str) -> str | None:
+    async def _request_chat_completion(
+        cls,
+        text: str,
+    ) -> str | OpenAITurnDirective | None:
         session_key = cls._session_key
         history = cls._sessions.setdefault(session_key, [])
         messages = cls._build_messages(history, text)
@@ -365,16 +399,28 @@ class OpenAIManager:
                     *(cls._run_tool_call(tc) for tc in tool_calls),
                     return_exceptions=True,
                 )
-                for tc, result in zip(tool_calls, results):
+                normalized_results = [
+                    result
+                    if isinstance(result, ToolCallResult)
+                    else ToolCallResult(
+                        text=f"工具执行失败: {result}",
+                        is_error=True,
+                    )
+                    for result in results
+                ]
+                should_end_silently = any(
+                    result.silent_end_turn for result in normalized_results
+                )
+                has_error = any(result.is_error for result in normalized_results)
+                if should_end_silently and not has_error:
+                    return OpenAITurnDirective.SILENT_END
+
+                for tc, result in zip(tool_calls, normalized_results):
                     messages.append(
                         {
                             "role": "tool",
                             "tool_call_id": tc.get("id", ""),
-                            "content": (
-                                str(result)
-                                if not isinstance(result, Exception)
-                                else f"工具执行失败: {result}"
-                            ),
+                            "content": result.text,
                         }
                     )
             else:
@@ -464,7 +510,7 @@ class OpenAIManager:
         return message if isinstance(message, dict) else None
 
     @classmethod
-    async def _run_tool_call(cls, tool_call: dict[str, Any]) -> str:
+    async def _run_tool_call(cls, tool_call: dict[str, Any]) -> ToolCallResult:
         """执行单个 tool_call（从 MCP client 路由到外部 server）"""
         from core.mcp_client import MCPClientManager
 
@@ -487,13 +533,20 @@ class OpenAIManager:
                 f"[OpenAI] Tool completed name={name!r}, "
                 f"elapsed_ms={round((time.monotonic() - started) * 1000)}"
             )
-            return result
+            return (
+                result
+                if isinstance(result, ToolCallResult)
+                else ToolCallResult(text=str(result))
+            )
         except asyncio.TimeoutError:
             logger.warning(
                 f"[OpenAI] Tool timed out name={name!r}, "
                 f"timeout={cls._tool_timeout:g}s"
             )
-            return f"工具调用超时（{cls._tool_timeout:g} 秒）：{name}"
+            return ToolCallResult(
+                text=f"工具调用超时（{cls._tool_timeout:g} 秒）：{name}",
+                is_error=True,
+            )
 
     @classmethod
     def _headers(cls) -> dict[str, str]:
@@ -565,7 +618,9 @@ class OpenAIManager:
     async def _wait_and_play_response(cls, run_id: str):
         try:
             response_text = await cls._wait_response(run_id)
-            if response_text:
+            if cls.is_silent_end_turn_result(response_text):
+                return
+            if isinstance(response_text, str) and response_text:
                 await cls._play_response_with_tts(
                     response_text,
                     tts_speaker=cls._response_tts_speakers.get(run_id),
