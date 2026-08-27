@@ -467,6 +467,8 @@ npx @modelcontextprotocol/inspector
     ...
     "use_mcp_tools": True,   # 启用外部 MCP 工具（需同时配置 mcp_servers）
     "max_tool_rounds": 5,    # 工具调用循环上限
+    "tool_confirmation_text": "好的，正在处理",  # 每轮首次调用前播报并等待完成
+    "tool_confirmation_timeout": 15,             # 播报超时则不执行 MCP
 },
 ```
 
@@ -495,6 +497,8 @@ npx @modelcontextprotocol/inspector
     "history_max_messages": 20,
     "response_timeout": 120,  # 整轮对话总等待时间（秒）
     "tool_timeout": 30,       # 单次 MCP 工具等待时间，需小于整轮超时
+    "tool_confirmation_text": "好的，正在处理",
+    "tool_confirmation_timeout": 15,
     "tts_speaker": "xiaoai",
 }
 ```
@@ -521,7 +525,7 @@ if "让小黑" in text:
     return None
 ```
 
-`base_url` 可以直接填到 `/v1`，框架会自动调用 `/chat/completions`；如果你的服务已经给出完整 `/v1/chat/completions` 地址，也可以直接填写完整地址。连续对话会按 `session_key` 保存最近 `history_max_messages` 条上下文；需要隔离多个助手时，可在唤醒前调用 `app.set_openai_session_key("assistant-name")`。启用 MCP 工具时，`tool_timeout` 会限制每次工具调用，超时结果会回传给模型，让模型在 `response_timeout` 到期前给出可诊断回复；整轮超时后 bridge 会取消仍在运行的请求和工具任务，避免迟到的副作用。
+`base_url` 可以直接填到 `/v1`，框架会自动调用 `/chat/completions`；如果你的服务已经给出完整 `/v1/chat/completions` 地址，也可以直接填写完整地址。连续对话会按 `session_key` 保存最近 `history_max_messages` 条上下文；需要隔离多个助手时，可在唤醒前调用 `app.set_openai_session_key("assistant-name")`。启用 MCP 工具时，每轮第一次真实调用前会完整播报 `tool_confirmation_text`，同轮后续工具和重试不会重复播报；确认播放失败或超过 `tool_confirmation_timeout` 时，本轮所有 MCP 调用都会跳过并转入现有错误回复路径。`tool_timeout` 会限制每次工具调用，超时结果会回传给模型，让模型在 `response_timeout` 到期前给出可诊断回复；整轮超时后 bridge 会取消仍在运行的请求和工具任务，避免迟到的副作用。
 
 ## 🐾 QwenPaw 集成
 
