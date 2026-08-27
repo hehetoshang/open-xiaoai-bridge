@@ -387,13 +387,19 @@ class OpenAIManager:
                     break
 
                 # 追加 assistant 消息（含 tool_calls；content 为 null 时显式置 None）
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": message.get("content") or None,
-                        "tool_calls": tool_calls,
-                    }
-                )
+                assistant_tool_message = {
+                    "role": "assistant",
+                    "content": message.get("content") or None,
+                    "tool_calls": tool_calls,
+                }
+                # DeepSeek thinking models require their opaque reasoning field
+                # to be echoed back alongside tool calls. Other providers never
+                # see this extension unless they returned it themselves.
+                if "reasoning_content" in message:
+                    assistant_tool_message["reasoning_content"] = message[
+                        "reasoning_content"
+                    ]
+                messages.append(assistant_tool_message)
                 # 并发执行本轮的多个工具调用
                 results = await asyncio.gather(
                     *(cls._run_tool_call(tc) for tc in tool_calls),

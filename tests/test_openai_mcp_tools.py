@@ -328,6 +328,26 @@ class OpenAIToolLoopTest(unittest.TestCase):
         self.assertEqual(len(self.captured_payloads), 2)
         self.assertEqual(self.captured_payloads[1]["messages"][-1]["content"], failure)
 
+    def test_reasoning_content_is_preserved_for_failure_followup(self):
+        self.mcp_stub.results["play_track"] = ToolCallResult(
+            text="播放失败：缺少歌曲参数",
+            is_error=True,
+        )
+        first = make_tool_call_response("play_track", {})
+        first["choices"][0]["message"]["reasoning_content"] = "opaque-provider-state"
+        self._set_sequential_responses(
+            [first, make_text_response("播放失败，请告诉我歌曲名称")]
+        )
+
+        result = self.run_async(self.manager._request_chat_completion("播放一首歌"))
+
+        self.assertEqual(result, "播放失败，请告诉我歌曲名称")
+        assistant_message = self.captured_payloads[1]["messages"][-2]
+        self.assertEqual(
+            assistant_message["reasoning_content"],
+            "opaque-provider-state",
+        )
+
     def test_silent_signal_does_not_swallow_sibling_failure(self):
         self.mcp_stub.results["play_track"] = ToolCallResult(
             text="正在播放：测试歌曲",
