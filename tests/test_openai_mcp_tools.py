@@ -47,6 +47,16 @@ class FakeMCPServer:
             return self.results[name]
         if name == "weather":
             return "北京晴天 25 度"
+        if name == "play_track":
+            return ToolCallResult(
+                text="正在播放：测试歌曲",
+                silent_end_turn=True,
+            )
+        if name == "play_failed":
+            return ToolCallResult(
+                text="[MCPClient] 工具 play_track 返回错误: 播放服务不可用",
+                is_error=True,
+            )
         if name == "slow_tool":
             await asyncio.sleep(0.05)
             return "slow result"
@@ -196,6 +206,45 @@ class OpenAIToolLoopTest(unittest.TestCase):
         self.assertEqual(
             sorted(self.mcp_stub.call_history), sorted([("weather", {"city": "北京"}), ("slow_tool", {})])
         )
+
+    def test_playback_success_skips_final_model_request(self):
+        """播放成功信号立即静默终止，不再请求模型生成确认文本"""
+        self._set_sequential_responses(
+            [make_tool_call_response("play_track", {"query": "测试歌曲"})]
+        )
+
+        result = self.run_async(self.manager._request_chat_completion("播放测试歌曲"))
+
+        self.assertTrue(self.manager.is_silent_end_turn_result(result))
+        self.assertEqual(len(self.captured_payloads), 1)
+        self.assertEqual(self.mcp_stub.call_history, [("play_track", {"query": "测试歌曲"})])
+        self.assertEqual(self.manager._sessions["test-session"], [])
+
+    def test_playback_failure_still_requests_audible_reply(self):
+        """播放失败作为工具错误交给模型，保留最终可播报回复"""
+        self._set_sequential_responses(
+            [
+                make_tool_call_response("play_failed", {}),
+                make_text_response("播放失败，请稍后再试"),
+            ]
+        )
+
+        result = self.run_async(self.manager._request_chat_completion("播放测试歌曲"))
+
+        self.assertEqual(result, "播放失败，请稍后再试")
+        self.assertEqual(len(self.captured_payloads), 2)
+        self.assertIn("播放服务不可用", self.captured_payloads[1]["messages"][-1]["content"])
+
+    def test_ordinary_tool_does_not_end_turn_silently(self):
+        """普通工具维持工具结果回传与最终模型请求"""
+        self._set_sequential_responses(
+            [make_tool_call_response("weather", {"city": "北京"}), make_text_response("晴天")]
+        )
+
+        result = self.run_async(self.manager._request_chat_completion("查天气"))
+
+        self.assertEqual(result, "晴天")
+        self.assertEqual(len(self.captured_payloads), 2)
 
     def test_bad_arguments_json_falls_back_to_empty(self):
         """坏 JSON 参数兜底为 {}"""
