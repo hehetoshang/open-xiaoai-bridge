@@ -377,6 +377,51 @@ class OpenAIToolLoopTest(unittest.TestCase):
             ],
         )
 
+    def test_verified_nonzero_native_tts_confirms_only_once(self):
+        """脚本非零但播放完成时放行，同轮连续工具仍只确认一次。"""
+        from core.ref import set_stream_player
+        from core.services.speaker import CommandResult, SpeakerManager
+
+        set_stream_player(None)
+        speaker = SpeakerManager()
+        confirmation_calls = []
+
+        async def completed_with_wrapper_failure(_script, timeout=0):
+            confirmation_calls.append(timeout)
+            return CommandResult(
+                stdout='{"code": 0}\n/tmp/tts/tts_dialog_123.mp3\n',
+                stderr="miplayer: event(EndReached) is posted\n",
+                exit_code=1,
+            )
+
+        async def play_verified_confirmation(cls, text, **kwargs):
+            return await speaker.play(text=text, blocking=True)
+
+        speaker.run_shell = completed_with_wrapper_failure
+        self.manager._play_response_with_tts = classmethod(play_verified_confirmation)
+        self._set_sequential_responses(
+            [
+                make_tool_call_response("weather", {"city": "北京"}, "search-1"),
+                make_tool_call_response(
+                    "play_track", {"query": "测试歌曲"}, "play-1"
+                ),
+            ]
+        )
+
+        result = self.run_async(
+            self.manager._request_chat_completion("搜索并播放测试歌曲")
+        )
+
+        self.assertTrue(self.manager.is_silent_end_turn_result(result))
+        self.assertEqual(len(confirmation_calls), 1)
+        self.assertEqual(
+            self.mcp_stub.call_history,
+            [
+                ("weather", {"city": "北京"}),
+                ("play_track", {"query": "测试歌曲"}),
+            ],
+        )
+
     def test_new_turn_confirms_again(self):
         """前置确认状态属于单轮，新用户轮次会重新确认"""
         for city in ("北京", "上海"):
