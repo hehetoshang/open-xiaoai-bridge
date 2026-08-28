@@ -508,7 +508,7 @@ npx @modelcontextprotocol/inspector
 ```python
 async def before_wakeup(speaker, text, source, app):
     if source == "kws" and "小黑" in text:
-        await speaker.play(text="小黑来了")
+        # controller 会播放短提示音；路由钩子不要等待完整 TTS
         return "openai"
 
     if source == "xiaoai" and text == "召唤小黑":
@@ -579,7 +579,7 @@ docker compose up -d
 ```python
 async def before_wakeup(speaker, text, source, app):
     if source == "kws" and "小爪" in text:
-        await speaker.play(text="小爪来了")
+        # controller 会播放短提示音；路由钩子不要等待完整 TTS
         return "qwenpaw"
 
     if source == "xiaoai" and text == "召唤小爪":
@@ -691,10 +691,8 @@ if "告诉龙虾" in text:
 async def before_wakeup(speaker, text, source, app):
     if source == "kws":          # 唤醒词触发
         if "龙虾" in text:
-            await speaker.play(text="龙虾来了")
             return "openclaw"    # → OpenClaw 连续对话
         if "小智" in text:
-            await speaker.play(text="小智来了")
             return "xiaozhi"     # → 小智 AI
         return None              # → 不处理
 
@@ -1112,7 +1110,6 @@ APP_CONFIG = {
     async def before_wakeup(speaker, text, source, app):
         if source == "kws" and "龙虾" in text:
             app.set_openclaw_session_key(new_session_key())
-            await speaker.play(text="龙虾来了")
             return "openclaw"
     ```
 

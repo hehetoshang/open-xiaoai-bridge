@@ -17,10 +17,12 @@ Key design decisions:
 
 import asyncio
 import os
+import time
 
 import open_xiaoai_server
 
-from core.ref import get_speaker, get_vad
+from core.ref import get_app, get_speaker, get_stream_player, get_vad
+from core.services.protocols.typing import DeviceState
 from core.utils.config import ConfigManager
 
 _NOTIFY_SOUND_PATH = os.path.join(
@@ -86,6 +88,7 @@ class ExternalConversationController:
         self._loop: asyncio.AbstractEventLoop | None = None
         # Playback token for the current TTS session
         self._playback_token: int | None = None
+        self.wakeup_started_at: float | None = None
 
     # ---- config helpers ----
 
@@ -129,6 +132,9 @@ class ExternalConversationController:
             return
         self.active = True
         self._loop = asyncio.get_running_loop()
+        app = get_app()
+        if app:
+            app.device_state = DeviceState.LISTENING
 
         logger.info(f"🎙️ 进入 {self.BACKEND_NAME} 连续对话模式", module=self.LOG_MODULE)
 
@@ -167,6 +173,9 @@ class ExternalConversationController:
                         f"Failed to stop XiaoAI native listening: {exc}",
                         module=self.LOG_MODULE,
                     )
+        app = get_app()
+        if app and app.device_state == DeviceState.LISTENING:
+            app.device_state = DeviceState.IDLE
         logger.info(f"👋 退出 {self.BACKEND_NAME} 连续对话模式", module=self.LOG_MODULE)
 
     # ---- conversation loop ----
@@ -174,16 +183,34 @@ class ExternalConversationController:
     async def _conversation_loop(self):
         """Run VAD -> ASR -> backend -> TTS turns until exit."""
 
-        # Mute mic → play notify → unmute.
-        # _play_notify() blocks for ~740ms (the beep duration), during which
-        # the mic is off and before_wakeup TTS echo naturally fades.
-        # VAD.resume() resets all state (speech_frames, input_bytes),
-        # so speech detection starts clean when listening begins.
-        await self._stop_recording()
-        logger.debug("Recording stopped", module=self.LOG_MODULE)
-        await self._play_notify()
-        await self._start_recording()
-        logger.debug("Ready to listen", module=self.LOG_MODULE)
+        stream_player = get_stream_player()
+        media_is_playing = bool(
+            stream_player and stream_player.get_status().get("playing")
+        )
+        if media_is_playing:
+            # AEC 已使用同一中转 PCM 作为参考流。保持音乐和录音链路运行，
+            # 避免 stop_playing RPC 进入唤醒关键路径；LISTENING 状态是反馈。
+            logger.info(
+                "phase=listening_feedback mode=aec_media_passthrough",
+                module=self.LOG_MODULE,
+            )
+        else:
+            # 无媒体时沿用关麦 → 短提示音 → 开麦，避免提示音进入 ASR。
+            await self._stop_recording()
+            logger.debug("Recording stopped", module=self.LOG_MODULE)
+            await self._play_notify()
+            await self._start_recording()
+        wakeup_started_at = getattr(self, "wakeup_started_at", None)
+        elapsed = (
+            (time.monotonic() - wakeup_started_at) * 1000
+            if wakeup_started_at is not None
+            else None
+        )
+        elapsed_field = f" elapsed_ms={elapsed:.0f}" if elapsed is not None else ""
+        logger.info(
+            f"phase=listening_ready{elapsed_field}",
+            module=self.LOG_MODULE,
+        )
 
         while self.active:
             if self.uses_xiaoai_asr():
@@ -585,9 +612,6 @@ class ExternalConversationController:
         if speaker:
             try:
                 await speaker.play(buffer=_NOTIFY_PCM)
-                # Wait for playback to finish: PCM is int16 at 24000Hz
-                duration = len(_NOTIFY_PCM) / (24000 * 2)
-                await asyncio.sleep(duration)
             except Exception as exc:
                 logger.debug(f"Notify sound error: {exc}", module=self.LOG_MODULE)
 
@@ -599,9 +623,6 @@ class ExternalConversationController:
         if speaker:
             try:
                 await speaker.play(buffer=_SEND_PCM)
-                # 等待播放完成：PCM 为 int16，24000Hz
-                duration = len(_SEND_PCM) / (24000 * 2)
-                await asyncio.sleep(duration)
             except Exception as exc:
                 logger.debug(f"Send sound error: {exc}", module=self.LOG_MODULE)
 

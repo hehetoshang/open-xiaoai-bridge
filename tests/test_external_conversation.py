@@ -16,6 +16,7 @@ sys.modules.setdefault(
 
 from core.external_conversation import ExternalConversationController
 from core.openai import OpenAITurnDirective
+from core.ref import set_app, set_stream_player
 
 
 class FakeConfig:
@@ -41,6 +42,8 @@ class FakeBackend:
 
 
 def make_controller(response):
+    set_app(None)
+    set_stream_player(None)
     controller = object.__new__(ExternalConversationController)
     controller.config = FakeConfig()
     controller.backend = FakeBackend(response)
@@ -53,6 +56,10 @@ def make_controller(response):
 
 
 class SilentEndConversationTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncTearDown(self):
+        set_app(None)
+        set_stream_player(None)
+
     async def test_xiaoai_asr_turn_silently_exits_without_tts(self):
         controller = make_controller(OpenAITurnDirective.SILENT_END)
         tts_calls = []
@@ -123,6 +130,32 @@ class SilentEndConversationTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(turns, 1)
         self.assertEqual(after_wakeup_calls, 0)
+
+    async def test_aec_media_path_skips_recording_restart_and_notify(self):
+        controller = make_controller(OpenAITurnDirective.SILENT_END)
+        calls = []
+
+        class PlayingStream:
+            @staticmethod
+            def get_status():
+                return {"playing": True}
+
+        async def record_call(name):
+            calls.append(name)
+
+        async def silent_turn():
+            return "silent_exit"
+
+        set_stream_player(PlayingStream())
+        controller.uses_xiaoai_asr = lambda: False
+        controller._stop_recording = lambda: record_call("stop_recording")
+        controller._play_notify = lambda: record_call("notify")
+        controller._start_recording = lambda: record_call("start_recording")
+        controller._run_one_turn_with_local_asr = silent_turn
+
+        await controller._conversation_loop()
+
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":

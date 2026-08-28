@@ -386,6 +386,22 @@ class QwenPawManager:
         tts_speaker: str | None = None,
         playback_token: int | None = None,
     ):
+        from core.services.media_preemption import temporary_stream_pause
+
+        async with temporary_stream_pause("qwenpaw_tts"):
+            return await cls._play_response_with_tts_unpreempted(
+                text,
+                tts_speaker=tts_speaker,
+                playback_token=playback_token,
+            )
+
+    @classmethod
+    async def _play_response_with_tts_unpreempted(
+        cls,
+        text: str,
+        tts_speaker: str | None = None,
+        playback_token: int | None = None,
+    ):
         """Synthesize text and play it through the speaker."""
         try:
             from core.ref import get_speaker

@@ -496,8 +496,6 @@ class XiaoZhi:
             return
         try:
             await speaker.play(buffer=_NOTIFY_PCM)
-            duration = len(_NOTIFY_PCM) / (24000 * 2)
-            await asyncio.sleep(duration)
         except Exception as exc:
             logger.debug(f"Notify sound error: {exc}", module="XiaoZhi")
 

@@ -18,6 +18,24 @@ from core.utils.config_loader import ensure_config_module_loaded
 ensure_config_module_loaded()
 
 
+class _FakeAEC:
+    @staticmethod
+    def feed_reference(*args, **kwargs):
+        return None
+
+    @staticmethod
+    def reset():
+        return None
+
+
+# StreamPlayer tests exercise transport ownership, not the DSP implementation.
+# Keep them runnable in the lightweight unit-test environment without NumPy/SciPy.
+sys.modules.setdefault(
+    "core.services.audio.aec",
+    types.SimpleNamespace(AEC=_FakeAEC()),
+)
+
+
 class FakeExt:
     """open_xiaoai_server 桩：记录 on_output_data / stop_playing 调用"""
 
@@ -179,6 +197,86 @@ class StreamPlayerTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.01)
         self.assertGreater(len(self.ext.sent), sent_at_pause)
 
+    async def test_temporary_pause_preserves_song_and_resumes_at_position(self):
+        await self.sp.play("http://example.com/song.mp3", loop=True)
+        for _ in range(100):
+            if self.sp.offset:
+                break
+            await asyncio.sleep(0.01)
+        original_url = self.sp.file_path
+        original_pcm = self.sp.pcm
+        original_position = self.sp.offset
+
+        token = await self.sp.acquire_temporary_pause("test_tts")
+        self.assertEqual(self.sp.state, "paused")
+        self.assertEqual(self.sp.file_path, original_url)
+        self.assertIs(self.sp.pcm, original_pcm)
+        self.assertEqual(self.sp.offset, original_position)
+
+        status = await self.sp.release_temporary_pause(token)
+        self.assertEqual(status["state"], "playing")
+        self.assertEqual(self.sp.file_path, original_url)
+
+    async def test_nested_temporary_pauses_resume_only_after_last_release(self):
+        await self.sp.play("http://example.com/song.mp3", loop=True)
+        first = await self.sp.acquire_temporary_pause("first_wakeup")
+        second = await self.sp.acquire_temporary_pause("repeated_wakeup")
+
+        await self.sp.release_temporary_pause(first)
+        self.assertEqual(self.sp.state, "paused")
+        await self.sp.release_temporary_pause(second)
+        self.assertEqual(self.sp.state, "playing")
+
+    async def test_explicit_pause_during_preemption_prevents_auto_resume(self):
+        await self.sp.play("http://example.com/song.mp3", loop=True)
+        token = await self.sp.acquire_temporary_pause("test_tts")
+
+        await self.sp.pause()
+        await self.sp.release_temporary_pause(token)
+
+        self.assertEqual(self.sp.state, "paused")
+        self.assertTrue(self.sp.pcm)
+
+    async def test_explicit_stop_invalidates_preemption_token(self):
+        await self.sp.play("http://example.com/song.mp3", loop=True)
+        token = await self.sp.acquire_temporary_pause("test_tts")
+
+        await self.sp.stop()
+        status = await self.sp.release_temporary_pause(token)
+
+        self.assertEqual(status["state"], "idle")
+        self.assertEqual(self.sp.pcm, b"")
+
+    async def test_temporary_pause_bounds_unresponsive_stop_rpc(self):
+        async def blocked_stop_playing():
+            await asyncio.Future()
+
+        self.sp.pcm = self.pcm
+        self.sp.state = "playing"
+        self.sp._task = asyncio.create_task(asyncio.sleep(60))
+        with (
+            patch.object(self.ext, "stop_playing", blocked_stop_playing),
+            patch.object(self.sp_mod, "STOP_PLAYING_TIMEOUT_SECONDS", 0.01),
+        ):
+            token = await asyncio.wait_for(
+                self.sp.acquire_temporary_pause("test_timeout"),
+                timeout=0.2,
+            )
+
+        self.assertEqual(self.sp.state, "paused")
+        await self.sp.release_temporary_pause(token)
+        self.assertEqual(self.sp.state, "playing")
+
+    async def test_next_song_invalidates_old_preemption_token(self):
+        await self.sp.play("http://example.com/first.mp3", loop=True)
+        token = await self.sp.acquire_temporary_pause("test_tts")
+
+        await self.sp.play("http://example.com/next.mp3", loop=True)
+        await self.sp.release_temporary_pause(token)
+
+        self.assertEqual(self.sp.state, "playing")
+        self.assertEqual(self.sp.file_path, "http://example.com/next.mp3")
+
     async def test_seek_jumps_position(self):
         await self.sp.play("http://example.com/song.mp3")
         target = int(len(self.pcm) / 2)
@@ -278,15 +376,22 @@ class StreamPlayerTest(unittest.IsolatedAsyncioTestCase):
                     "https://attacker.example/song.mp3"
                 )
 
-    async def test_speaker_play_interrupts_stream_player(self):
-        """SpeakerManager.play 打断中转推流（stream_player.stop 被调用）"""
+    async def test_blocking_speaker_play_temporarily_pauses_stream_player(self):
+        """阻塞式 TTS 只取得临时暂停 token，结束后自动释放。"""
         from core.ref import set_stream_player
 
-        stopped = []
+        calls = []
 
         class FakeStreamPlayer:
+            async def acquire_temporary_pause(self, reason):
+                calls.append(("acquire", reason))
+                return 7
+
+            async def release_temporary_pause(self, token):
+                calls.append(("release", token))
+
             async def stop(self):
-                stopped.append("stop")
+                calls.append(("stop", None))
 
         set_stream_player(FakeStreamPlayer())
 
@@ -296,7 +401,65 @@ class StreamPlayerTest(unittest.IsolatedAsyncioTestCase):
         sm.run_shell = self._fake_run_shell
 
         await sm.play(text="你好")
-        self.assertIn("stop", stopped)
+        self.assertEqual(
+            calls,
+            [("acquire", "speaker_play"), ("release", 7)],
+        )
+
+    async def test_blocking_speaker_failure_still_releases_temporary_pause(self):
+        from core.ref import set_stream_player
+
+        calls = []
+
+        class FakeStreamPlayer:
+            async def acquire_temporary_pause(self, reason):
+                calls.append("acquire")
+                return 11
+
+            async def release_temporary_pause(self, token):
+                calls.append(("release", token))
+
+        async def fail_run_shell(*args, **kwargs):
+            raise RuntimeError("device unavailable")
+
+        set_stream_player(FakeStreamPlayer())
+        from core.services.speaker import SpeakerManager
+
+        sm = SpeakerManager()
+        sm.run_shell = fail_run_shell
+        with self.assertRaisesRegex(RuntimeError, "device unavailable"):
+            await sm.play(text="你好")
+        self.assertEqual(calls, ["acquire", ("release", 11)])
+
+    async def test_cancelled_speaker_play_still_releases_temporary_pause(self):
+        from core.ref import set_stream_player
+
+        calls = []
+        started = asyncio.Event()
+
+        class FakeStreamPlayer:
+            async def acquire_temporary_pause(self, reason):
+                calls.append("acquire")
+                return 13
+
+            async def release_temporary_pause(self, token):
+                calls.append(("release", token))
+
+        async def blocked_run_shell(*args, **kwargs):
+            started.set()
+            await asyncio.Future()
+
+        set_stream_player(FakeStreamPlayer())
+        from core.services.speaker import SpeakerManager
+
+        sm = SpeakerManager()
+        sm.run_shell = blocked_run_shell
+        task = asyncio.create_task(sm.play(text="你好"))
+        await started.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(calls, ["acquire", ("release", 13)])
 
     async def _fake_run_shell(self, script, timeout=0):
         from core.services.speaker import CommandResult
