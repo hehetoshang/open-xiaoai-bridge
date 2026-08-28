@@ -28,6 +28,10 @@ BYTES_PER_SECOND = 48000
 MAX_DOWNLOAD_BYTES = int(
     os.environ.get("STREAM_PLAYER_MAX_DOWNLOAD_BYTES", 128 * 1024 * 1024)
 )
+# Rust stop_playing() 最终等待设备 RPC；链路异常时不能无限阻塞唤醒/TTS。
+STOP_PLAYING_TIMEOUT_SECONDS = float(
+    os.environ.get("STREAM_PLAYER_STOP_TIMEOUT_SECONDS", "1.5")
+)
 
 
 def _trusted_stream_hosts() -> set[str]:
@@ -133,6 +137,11 @@ class StreamPlayer:
         self.loop: bool = False
         self._task: asyncio.Task | None = None
         self._session: aiohttp.ClientSession | None = None
+        # 临时抢占（TTS / 提示音）只暂停，不清空歌曲。token 使并发/重复
+        # 抢占只有最后一个持有者释放时才恢复，并避免恢复用户主动停止的音乐。
+        self._preemption_serial = 0
+        self._preemption_tokens: set[int] = set()
+        self._preemption_should_resume = False
         set_stream_player(self)
 
     # ---------- 生命周期 ----------
@@ -237,6 +246,9 @@ class StreamPlayer:
         return await self._run_on_owner_loop(self._pause())
 
     async def _pause(self) -> dict:
+        # 即使当前已被临时抢占暂停，用户再次发出 pause 也应取消自动恢复。
+        if self._preemption_tokens:
+            self._preemption_should_resume = False
         if self.state != "playing":
             return self.get_status()
         await self._cancel_pump()
@@ -249,6 +261,9 @@ class StreamPlayer:
         return await self._run_on_owner_loop(self._resume())
 
     async def _resume(self) -> dict:
+        # 用户显式恢复取得状态所有权，后续旧 token 不得再次操作播放状态。
+        self._preemption_tokens.clear()
+        self._preemption_should_resume = False
         if self.state != "paused":
             return self.get_status()
         if not self.pcm:
@@ -282,6 +297,9 @@ class StreamPlayer:
         return await self._run_on_owner_loop(self._stop())
 
     async def _stop(self) -> dict:
+        # stop/next 等用户操作会使所有旧临时抢占 token 失效。
+        self._preemption_tokens.clear()
+        self._preemption_should_resume = False
         await self._cancel_pump()
         self.state = "idle"
         self.file_path = None
@@ -289,6 +307,59 @@ class StreamPlayer:
         self.offset = 0
         self.duration_ms = 0
         self.loop = False
+        return self.get_status()
+
+    async def acquire_temporary_pause(self, reason: str = "transient_audio") -> int:
+        """为短暂音频抢占创建可幂等释放的暂停 token。
+
+        首个 token 负责暂停当前歌曲；嵌套或重复唤醒只增加持有者，不会
+        重复 pause。原本已经 paused/idle 的播放器不会被错误自动恢复。
+        """
+        return await self._run_on_owner_loop(
+            self._acquire_temporary_pause(reason)
+        )
+
+    async def _acquire_temporary_pause(self, reason: str) -> int:
+        self._preemption_serial += 1
+        token = self._preemption_serial
+
+        if not self._preemption_tokens:
+            self._preemption_should_resume = self.state == "playing"
+            if self._preemption_should_resume:
+                await self._cancel_pump()
+                self.state = "paused"
+                logger.info(
+                    f"[StreamPlayer] temporarily paused at {self._offset_ms()}ms "
+                    f"for {reason}",
+                    module="StreamPlayer",
+                )
+
+        self._preemption_tokens.add(token)
+        return token
+
+    async def release_temporary_pause(self, token: int) -> dict:
+        """释放临时暂停；仅恢复仍由这组 token 拥有的 paused 状态。"""
+        return await self._run_on_owner_loop(
+            self._release_temporary_pause(token)
+        )
+
+    async def _release_temporary_pause(self, token: int) -> dict:
+        if token not in self._preemption_tokens:
+            return self.get_status()
+
+        self._preemption_tokens.remove(token)
+        if self._preemption_tokens:
+            return self.get_status()
+
+        should_resume = self._preemption_should_resume
+        self._preemption_should_resume = False
+        if should_resume and self.state == "paused" and self.pcm:
+            self.state = "playing"
+            self._start_pump()
+            logger.info(
+                f"[StreamPlayer] automatically resumed at {self._offset_ms()}ms",
+                module="StreamPlayer",
+            )
         return self.get_status()
 
     def get_status(self) -> dict:
@@ -321,7 +392,17 @@ class StreamPlayer:
             except asyncio.CancelledError:
                 pass
         self._task = None
-        await open_xiaoai_server.stop_playing()
+        try:
+            await asyncio.wait_for(
+                open_xiaoai_server.stop_playing(),
+                timeout=STOP_PLAYING_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[StreamPlayer] stop_playing RPC timed out; continuing with "
+                "local pump stopped",
+                module="StreamPlayer",
+            )
         AEC.reset()
 
     async def _pump(self) -> None:

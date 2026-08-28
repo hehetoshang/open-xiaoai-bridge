@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 from core.ref import (
     get_app,
@@ -129,6 +130,7 @@ class WakeupSessionManager:
         return False
 
     async def wakeup(self, text, source):
+        wakeup_started_at = time.monotonic()
         before_wakeup = self.config.get_app_config("wakeup.before_wakeup")
         kws = get_kws()
         logger.debug(f"[Wakeup] Received wakeup request from {source}: {text}")
@@ -161,20 +163,32 @@ class WakeupSessionManager:
         )
         if kws:
             kws.resume()
-        logger.info(f"[Wakeup] before_wakeup returned: {should_wakeup}")
+        logger.info(
+            f"[Wakeup] phase=route_resolved elapsed_ms="
+            f"{(time.monotonic() - wakeup_started_at) * 1000:.0f} "
+            f"route={should_wakeup}"
+        )
         if should_wakeup is not None:
             await self.reset_all_sessions()
+            logger.debug(
+                f"[Wakeup] phase=sessions_reset elapsed_ms="
+                f"{(time.monotonic() - wakeup_started_at) * 1000:.0f}"
+            )
 
         if should_wakeup == "openclaw":
-            await self._start_openclaw_conversation()
+            await self._start_openclaw_conversation(wakeup_started_at)
         elif should_wakeup == "openai":
-            await self._start_openai_conversation()
+            await self._start_openai_conversation(wakeup_started_at)
         elif should_wakeup == "qwenpaw":
-            await self._start_qwenpaw_conversation()
+            await self._start_qwenpaw_conversation(wakeup_started_at)
         elif should_wakeup == "xiaozhi":
+            logger.info(
+                f"[Wakeup] phase=xiaozhi_dispatched elapsed_ms="
+                f"{(time.monotonic() - wakeup_started_at) * 1000:.0f}"
+            )
             self.on_wakeup()
 
-    async def _start_openclaw_conversation(self):
+    async def _start_openclaw_conversation(self, wakeup_started_at=None):
         """Start an OpenClaw continuous conversation session.
 
         This runs independently of the XiaoZhi session state machine.
@@ -187,6 +201,7 @@ class WakeupSessionManager:
             kws.pause()
         try:
             self._openclaw_controller = OpenClawConversationController()
+            self._openclaw_controller.wakeup_started_at = wakeup_started_at
             self._openclaw_task = asyncio.create_task(self._openclaw_controller.start())
             await self._openclaw_task
         except asyncio.CancelledError:
@@ -202,7 +217,7 @@ class WakeupSessionManager:
             if kws:
                 kws.resume()
 
-    async def _start_openai_conversation(self):
+    async def _start_openai_conversation(self, wakeup_started_at=None):
         """Start an OpenAI-compatible continuous conversation session."""
         from core.openai_conversation import OpenAIConversationController
 
@@ -211,6 +226,7 @@ class WakeupSessionManager:
             kws.pause()
         try:
             self._openai_controller = OpenAIConversationController()
+            self._openai_controller.wakeup_started_at = wakeup_started_at
             self._openai_task = asyncio.create_task(self._openai_controller.start())
             await self._openai_task
         except asyncio.CancelledError:
@@ -226,7 +242,7 @@ class WakeupSessionManager:
             if kws:
                 kws.resume()
 
-    async def _start_qwenpaw_conversation(self):
+    async def _start_qwenpaw_conversation(self, wakeup_started_at=None):
         """Start a QwenPaw continuous conversation session."""
         from core.qwenpaw_conversation import QwenPawConversationController
 
@@ -235,6 +251,7 @@ class WakeupSessionManager:
             kws.pause()
         try:
             self._qwenpaw_controller = QwenPawConversationController()
+            self._qwenpaw_controller.wakeup_started_at = wakeup_started_at
             self._qwenpaw_task = asyncio.create_task(self._qwenpaw_controller.start())
             await self._qwenpaw_task
         except asyncio.CancelledError:
@@ -278,8 +295,9 @@ class WakeupSessionManager:
         if self._qwenpaw_controller and self._qwenpaw_controller.is_active():
             self._qwenpaw_controller.stop()
 
-        # Stop all audio playback on the device
-        await self._stop_device_playback()
+        # 不在普通 KWS 唤醒路径执行全局 stop。外部 controller 使用自己的
+        # playback_token 停止会话 TTS；XiaoZhi 使用协议 abort。全局 stop 会
+        # 错把不属于会话的音乐/队列当作清理对象，并阻塞进入监听。
 
         logger.debug("[Wakeup] All sessions reset")
 

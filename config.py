@@ -66,21 +66,19 @@ async def before_wakeup(speaker, text, source, app):
         #     await speaker.play(server_file="/path/to/openclaw_intro.wav")
         #     return "openclaw"
 
-        # Route to OpenClaw Agent by wake word
+        # Route to an Agent by wake word. 连续对话 controller 会在关麦后
+        # 立即播放短提示音，再进入监听。不在路由钩子里等待完整 TTS，
+        # 否则 TTS/媒体暂停时长会直接叠加到 KWS → listening 关键路径。
         if "龙虾" in text:
-            await speaker.play(text="龙虾来了")
             return "openclaw"
 
         if "小黑" in text:
-            await speaker.play(text="小黑来了")
             return "openai"
 
         if "小爪" in text:
-            await speaker.play(text="小爪来了")
             return "qwenpaw"
 
         if "小智" in text:
-            await speaker.play(text="小智来了")
             return "xiaozhi"
 
         return None

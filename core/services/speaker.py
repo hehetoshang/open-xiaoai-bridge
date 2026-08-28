@@ -64,44 +64,61 @@ class SpeakerManager:
             timeout: 超时时长（毫秒），默认10分钟
             blocking: 是否阻塞运行
         """
-        # 打断中转推流播放（PCM 通道），保证同一时刻只有一路声音
+        # 阻塞式 TTS / 提示音属于短暂抢占：保留中转歌曲、位置和循环状态，
+        # 并在成功、失败、超时或取消后释放本次 token。非阻塞播放没有可靠的
+        # 完成事件，仍沿用替换语义，避免两路 PCM 长期重叠。
         from core.ref import get_stream_player
 
         stream_player = get_stream_player()
+        pause_token = None
         if stream_player:
-            await stream_player.stop()
+            if blocking and hasattr(stream_player, "acquire_temporary_pause"):
+                pause_token = await stream_player.acquire_temporary_pause(
+                    reason="speaker_play"
+                )
+            else:
+                await stream_player.stop()
 
-        if server_file is not None:
-            return await self.play_server_file(
-                file_path=server_file,
-                blocking=blocking,
-            )
+        try:
+            if server_file is not None:
+                return await self.play_server_file(
+                    file_path=server_file,
+                    blocking=blocking,
+                )
 
-        if buffer is not None:
-            return get_xiaoai().on_output_data(buffer)
+            if buffer is not None:
+                result = get_xiaoai().on_output_data(buffer)
+                if blocking:
+                    # PCM buffer 为 24kHz / int16 / mono；阻塞语义应覆盖实际
+                    # 播放窗口，使临时抢占 token 不会提前恢复音乐造成混音。
+                    await asyncio.sleep(len(buffer) / (24000 * 2))
+                return result
 
-        if blocking:
-            native_text = text or "你好"
-            escaped_text = native_text.replace("'", "'\\''")
-            command = (
-                f"miplayer -f '{url}'"
-                if url
-                else f"/usr/sbin/tts_play.sh '{escaped_text}'"
-            )
+            if blocking:
+                native_text = text or "你好"
+                escaped_text = native_text.replace("'", "'\\''")
+                command = (
+                    f"miplayer -f '{url}'"
+                    if url
+                    else f"/usr/sbin/tts_play.sh '{escaped_text}'"
+                )
+                res = await self.run_shell(command, timeout=timeout)
+                if not url:
+                    return self._native_tts_completed(res)
+                return res.exit_code == 0
+
+            if url:
+                data = json_encode({"url": url, "type": 1})
+                command = f"ubus call mediaplayer player_play_url '{data}'"
+            else:
+                data = json_encode({"text": text or "你好", "save": 0})
+                command = f"ubus call mibrain text_to_speech '{data}'"
+
             res = await self.run_shell(command, timeout=timeout)
-            if not url:
-                return self._native_tts_completed(res)
-            return res.exit_code == 0
-
-        if url:
-            data = json_encode({"url": url, "type": 1})
-            command = f"ubus call mediaplayer player_play_url '{data}'"
-        else:
-            data = json_encode({"text": text or "你好", "save": 0})
-            command = f"ubus call mibrain text_to_speech '{data}'"
-
-        res = await self.run_shell(command, timeout=timeout)
-        return '"code": 0' in res.stdout if res else False
+            return '"code": 0' in res.stdout if res else False
+        finally:
+            if pause_token is not None:
+                await stream_player.release_temporary_pause(pause_token)
 
     @classmethod
     def _native_tts_completed(cls, result: CommandResult) -> bool:

@@ -961,6 +961,22 @@ class OpenClawManager:
         tts_speaker: str | None = None,
         playback_token: int | None = None,
     ):
+        from core.services.media_preemption import temporary_stream_pause
+
+        async with temporary_stream_pause("openclaw_tts"):
+            return await cls._play_response_with_tts_unpreempted(
+                text,
+                tts_speaker=tts_speaker,
+                playback_token=playback_token,
+            )
+
+    @classmethod
+    async def _play_response_with_tts_unpreempted(
+        cls,
+        text: str,
+        tts_speaker: str | None = None,
+        playback_token: int | None = None,
+    ):
         """Synthesize text using Doubao TTS and play through speaker."""
         try:
             from core.ref import get_speaker
@@ -991,13 +1007,6 @@ class OpenClawManager:
                 if speaker:
                     await speaker.play(text=text, blocking=True)
                 return
-
-            # 打断中转推流播放（AI 回复优先，避免与播歌/听书混音）
-            from core.ref import get_stream_player
-
-            stream_player = get_stream_player()
-            if stream_player:
-                await stream_player.stop()
 
             speaker_id = resolved_tts_speaker or tts_config.get(
                 "default_speaker", "zh_female_xiaohe_uranus_bigtts"
