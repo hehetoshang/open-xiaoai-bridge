@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 from typing import Literal
 
 import open_xiaoai_server
@@ -17,6 +18,10 @@ class CommandResult:
 
 
 class SpeakerManager:
+    _NATIVE_TTS_RESULT_CODE_PATTERN = re.compile(r'"code"\s*:\s*0(?:\D|$)')
+    _NATIVE_TTS_FILE_PATTERN = re.compile(r"/tmp/tts/[^\s'\"]+\.mp3")
+    _NATIVE_TTS_END_MARKER = "event(EndReached) is posted"
+
     status: Literal["playing", "paused", "idle"] = "idle"
 
     def __init__(self):
@@ -76,12 +81,16 @@ class SpeakerManager:
             return get_xiaoai().on_output_data(buffer)
 
         if blocking:
+            native_text = text or "你好"
+            escaped_text = native_text.replace("'", "'\\''")
             command = (
                 f"miplayer -f '{url}'"
                 if url
-                else f"/usr/sbin/tts_play.sh '{text.replace("'", "'\\''") or '你好'}'"
+                else f"/usr/sbin/tts_play.sh '{escaped_text}'"
             )
             res = await self.run_shell(command, timeout=timeout)
+            if not url:
+                return self._native_tts_completed(res)
             return res.exit_code == 0
 
         if url:
@@ -93,6 +102,42 @@ class SpeakerManager:
 
         res = await self.run_shell(command, timeout=timeout)
         return '"code": 0' in res.stdout if res else False
+
+    @classmethod
+    def _native_tts_completed(cls, result: CommandResult) -> bool:
+        """Accept only an exit zero or a fully observed native playback.
+
+        Some XiaoAI firmware leaves ``tts_play.sh`` with the result of a final
+        shell condition used to resume previous media. When nothing was playing
+        before TTS, that condition is false and the script exits 1 even though
+        synthesis and ``miplayer`` both completed. The device's ``EndReached``
+        event is the playback-complete signal; the successful synthesis response
+        and generated file path tie it to this invocation.
+        """
+        if result.exit_code == 0:
+            return True
+
+        synthesis_ok = bool(
+            cls._NATIVE_TTS_RESULT_CODE_PATTERN.search(result.stdout)
+        )
+        generated_file = bool(cls._NATIVE_TTS_FILE_PATTERN.search(result.stdout))
+        playback_ended = cls._NATIVE_TTS_END_MARKER in result.stderr
+        completed = synthesis_ok and generated_file and playback_ended
+
+        if completed:
+            logger.warning(
+                "Blocking native TTS completed with a non-zero wrapper exit "
+                f"code={result.exit_code}; accepted verified EndReached signal",
+                module="Speaker",
+            )
+        else:
+            logger.warning(
+                "Blocking native TTS failed "
+                f"exit_code={result.exit_code}, synthesis_ok={synthesis_ok}, "
+                f"generated_file={generated_file}, playback_ended={playback_ended}",
+                module="Speaker",
+            )
+        return completed
 
     async def play_server_file(
         self,
