@@ -129,7 +129,7 @@ class WakeupSessionManager:
                 )
         return False
 
-    async def wakeup(self, text, source):
+    async def wakeup(self, text, source, on_route_resolved=None):
         wakeup_started_at = time.monotonic()
         before_wakeup = self.config.get_app_config("wakeup.before_wakeup")
         kws = get_kws()
@@ -155,19 +155,25 @@ class WakeupSessionManager:
 
         if kws:
             kws.pause()
-        should_wakeup = await before_wakeup(
-            get_speaker(),
-            text,
-            source,
-            get_app(),
-        )
-        if kws:
-            kws.resume()
+        try:
+            should_wakeup = await before_wakeup(
+                get_speaker(),
+                text,
+                source,
+                get_app(),
+            )
+        finally:
+            if kws:
+                kws.resume()
         logger.info(
             f"[Wakeup] phase=route_resolved elapsed_ms="
             f"{(time.monotonic() - wakeup_started_at) * 1000:.0f} "
             f"route={should_wakeup}"
         )
+        if on_route_resolved is not None:
+            callback_result = on_route_resolved(should_wakeup)
+            if asyncio.iscoroutine(callback_result):
+                await callback_result
         if should_wakeup is not None:
             await self.reset_all_sessions()
             logger.debug(
@@ -197,13 +203,16 @@ class WakeupSessionManager:
         from core.openclaw_conversation import OpenClawConversationController
 
         kws = get_kws()
+        task = None
         if kws:
             kws.pause()
         try:
-            self._openclaw_controller = OpenClawConversationController()
-            self._openclaw_controller.wakeup_started_at = wakeup_started_at
-            self._openclaw_task = asyncio.create_task(self._openclaw_controller.start())
-            await self._openclaw_task
+            controller = OpenClawConversationController()
+            controller.wakeup_started_at = wakeup_started_at
+            task = asyncio.create_task(controller.start())
+            self._openclaw_controller = controller
+            self._openclaw_task = task
+            await task
         except asyncio.CancelledError:
             pass  # interrupted cleanly by on_interrupt
         except Exception as exc:
@@ -212,8 +221,9 @@ class WakeupSessionManager:
                 module="Wakeup",
             )
         finally:
-            self._openclaw_controller = None
-            self._openclaw_task = None
+            if task is not None and self._openclaw_task is task:
+                self._openclaw_controller = None
+                self._openclaw_task = None
             if kws:
                 kws.resume()
 
@@ -222,13 +232,16 @@ class WakeupSessionManager:
         from core.openai_conversation import OpenAIConversationController
 
         kws = get_kws()
+        task = None
         if kws:
             kws.pause()
         try:
-            self._openai_controller = OpenAIConversationController()
-            self._openai_controller.wakeup_started_at = wakeup_started_at
-            self._openai_task = asyncio.create_task(self._openai_controller.start())
-            await self._openai_task
+            controller = OpenAIConversationController()
+            controller.wakeup_started_at = wakeup_started_at
+            task = asyncio.create_task(controller.start())
+            self._openai_controller = controller
+            self._openai_task = task
+            await task
         except asyncio.CancelledError:
             pass
         except Exception as exc:
@@ -237,8 +250,9 @@ class WakeupSessionManager:
                 module="Wakeup",
             )
         finally:
-            self._openai_controller = None
-            self._openai_task = None
+            if task is not None and self._openai_task is task:
+                self._openai_controller = None
+                self._openai_task = None
             if kws:
                 kws.resume()
 
@@ -247,13 +261,16 @@ class WakeupSessionManager:
         from core.qwenpaw_conversation import QwenPawConversationController
 
         kws = get_kws()
+        task = None
         if kws:
             kws.pause()
         try:
-            self._qwenpaw_controller = QwenPawConversationController()
-            self._qwenpaw_controller.wakeup_started_at = wakeup_started_at
-            self._qwenpaw_task = asyncio.create_task(self._qwenpaw_controller.start())
-            await self._qwenpaw_task
+            controller = QwenPawConversationController()
+            controller.wakeup_started_at = wakeup_started_at
+            task = asyncio.create_task(controller.start())
+            self._qwenpaw_controller = controller
+            self._qwenpaw_task = task
+            await task
         except asyncio.CancelledError:
             pass
         except Exception as exc:
@@ -262,8 +279,9 @@ class WakeupSessionManager:
                 module="Wakeup",
             )
         finally:
-            self._qwenpaw_controller = None
-            self._qwenpaw_task = None
+            if task is not None and self._qwenpaw_task is task:
+                self._qwenpaw_controller = None
+                self._qwenpaw_task = None
             if kws:
                 kws.resume()
 
@@ -294,6 +312,20 @@ class WakeupSessionManager:
             self._openai_controller.stop()
         if self._qwenpaw_controller and self._qwenpaw_controller.is_active():
             self._qwenpaw_controller.stop()
+
+        active_tasks = [
+            task
+            for task in (
+                self._openclaw_task,
+                self._openai_task,
+                self._qwenpaw_task,
+            )
+            if task and not task.done()
+        ]
+        for task in active_tasks:
+            task.cancel()
+        if active_tasks:
+            await asyncio.gather(*active_tasks, return_exceptions=True)
 
         # 不在普通 KWS 唤醒路径执行全局 stop。外部 controller 使用自己的
         # playback_token 停止会话 TTS；XiaoZhi 使用协议 abort。全局 stop 会

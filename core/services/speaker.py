@@ -311,11 +311,22 @@ class SpeakerManager:
         try:
             res = await get_xiaoai().run_shell(script, timeout=timeout)
             data = json_decode(res)
-            if data:
+            if isinstance(data, dict):
                 return CommandResult(
                     data.get("stdout", ""),
                     data.get("stderr", ""),
                     data.get("exit_code", 0),
                 )
-        except Exception:
-            return CommandResult("error", res, -1)
+            logger.warning(
+                "Remote shell returned an invalid result",
+                module="Speaker",
+            )
+            return CommandResult("", "invalid remote shell result", -1)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                f"Remote shell failed (error_type={type(exc).__name__})",
+                module="Speaker",
+            )
+            return CommandResult("", "remote shell failed", -1)

@@ -55,6 +55,17 @@ class XiaoAIWakeupKeywordTest(unittest.TestCase):
         np_stub = types.SimpleNamespace(int16=object(), float32=object())
         server_stub = types.SimpleNamespace()
 
+        class AECStub:
+            @staticmethod
+            def configure(_config):
+                return None
+
+            @staticmethod
+            def process_capture(data, **_kwargs):
+                return data
+
+        aec_stub = types.SimpleNamespace(AEC=AECStub())
+
         class ConfigManagerStub:
             @classmethod
             def instance(cls):
@@ -84,6 +95,7 @@ class XiaoAIWakeupKeywordTest(unittest.TestCase):
                     "numpy": np_stub,
                     "open_xiaoai_server": server_stub,
                     "core.utils.config": config_stub,
+                    "core.services.audio.aec": aec_stub,
                 },
             ):
                 xiaoai_module = importlib.import_module("core.xiaoai")
@@ -102,8 +114,11 @@ class XiaoAIWakeupKeywordTest(unittest.TestCase):
                 return False
 
             @staticmethod
-            async def wakeup(text, source):
+            async def wakeup(text, source, **kwargs):
                 calls.append((text, source))
+                callback = kwargs.get("on_route_resolved")
+                if callback:
+                    callback("openai")
 
         class ConversationStub:
             def __init__(self):
@@ -115,8 +130,15 @@ class XiaoAIWakeupKeywordTest(unittest.TestCase):
             def apply_runtime_config(self, _config):
                 pass
 
-        async def suppress_dialog(dialog_id, reason):
-            calls.append(("suppress", dialog_id, reason))
+            async def handle_text_command(self, _text, _speaker):
+                return None
+
+        def claim_dialog(dialog_id, reason):
+            calls.append(("claim", dialog_id, reason))
+            return True
+
+        async def suppress_dialog(_dialog_id, _reason, **_kwargs):
+            return None
 
         conversation = ConversationStub()
         xiaoai_module.XiaoAI.conversation = conversation
@@ -146,6 +168,11 @@ class XiaoAIWakeupKeywordTest(unittest.TestCase):
             mock.patch.object(xiaoai_module, "EventManager", EventManagerStub),
             mock.patch.object(
                 xiaoai_module.XiaoAI,
+                "_claim_dialog",
+                side_effect=claim_dialog,
+            ),
+            mock.patch.object(
+                xiaoai_module.XiaoAI,
                 "_suppress_dialog",
                 side_effect=suppress_dialog,
             ),
@@ -156,8 +183,44 @@ class XiaoAIWakeupKeywordTest(unittest.TestCase):
         self.assertEqual(
             calls,
             [
-                ("suppress", "dialog-1", "外部唤醒词接管: 你好小黑"),
+                ("claim", "dialog-1", "外部唤醒词接管: 你好小黑"),
                 ("你好小黑", "kws"),
+            ],
+        )
+
+        calls.clear()
+        conversation.reset_count = 0
+        line["header"]["dialog_id"] = "dialog-2"
+        line["payload"]["results"] = [{"text": "召唤小黑"}]
+        event = json.dumps(
+            {
+                "event": "instruction",
+                "data": {"NewLine": json.dumps(line, ensure_ascii=False)},
+            },
+            ensure_ascii=False,
+        )
+
+        with (
+            mock.patch.object(xiaoai_module, "EventManager", EventManagerStub),
+            mock.patch.object(
+                xiaoai_module.XiaoAI,
+                "_claim_dialog",
+                side_effect=claim_dialog,
+            ),
+            mock.patch.object(
+                xiaoai_module.XiaoAI,
+                "_suppress_dialog",
+                side_effect=suppress_dialog,
+            ),
+        ):
+            asyncio.run(xiaoai_module.XiaoAI.on_event(event))
+
+        self.assertEqual(conversation.reset_count, 1)
+        self.assertEqual(
+            calls,
+            [
+                ("召唤小黑", "xiaoai"),
+                ("claim", "dialog-2", "Bridge 路由接管: 召唤小黑"),
             ],
         )
 
