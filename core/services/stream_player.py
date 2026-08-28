@@ -371,7 +371,21 @@ class StreamPlayer:
             "loop": self.loop,
             "playing": self.state == "playing",
             "paused": self.state == "paused",
+            "temporarily_paused": bool(self._preemption_tokens),
         }
+
+    def has_resumable_media(self) -> bool:
+        """播放会话是否仍由临时抢占持有，结束后可自动续播。"""
+        return bool(
+            self.pcm
+            and (
+                self.state == "playing"
+                or (
+                    self._preemption_tokens
+                    and self._preemption_should_resume
+                )
+            )
+        )
 
     # ---------- 内部 ----------
 

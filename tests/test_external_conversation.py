@@ -1,5 +1,6 @@
 """Conversation behavior for explicit silent-end backend directives."""
 
+import asyncio
 import sys
 import types
 import unittest
@@ -16,7 +17,7 @@ sys.modules.setdefault(
 
 from core.external_conversation import ExternalConversationController
 from core.openai import OpenAITurnDirective
-from core.ref import set_app, set_stream_player
+from core.ref import set_app, set_speaker, set_stream_player
 
 
 class FakeConfig:
@@ -58,6 +59,7 @@ def make_controller(response):
 class SilentEndConversationTest(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         set_app(None)
+        set_speaker(None)
         set_stream_player(None)
 
     async def test_xiaoai_asr_turn_silently_exits_without_tts(self):
@@ -156,6 +158,73 @@ class SilentEndConversationTest(unittest.IsolatedAsyncioTestCase):
         await controller._conversation_loop()
 
         self.assertEqual(calls, [])
+
+    async def test_temporarily_paused_media_uses_fast_aec_path(self):
+        controller = make_controller(OpenAITurnDirective.SILENT_END)
+        calls = []
+
+        class PreemptedStream:
+            @staticmethod
+            def has_resumable_media():
+                return True
+
+        async def record_call(name):
+            calls.append(name)
+
+        async def silent_turn():
+            return "silent_exit"
+
+        set_stream_player(PreemptedStream())
+        controller.uses_xiaoai_asr = lambda: False
+        controller._stop_recording = lambda: record_call("stop_recording")
+        controller._play_notify = lambda: record_call("notify")
+        controller._start_recording = lambda: record_call("start_recording")
+        controller._run_one_turn_with_local_asr = silent_turn
+
+        await controller._conversation_loop()
+
+        self.assertEqual(calls, [])
+
+    async def test_tts_timeout_stops_device_audio_without_replaying(self):
+        controller = make_controller("unused")
+        controller._cfg = lambda key, default=None: 0.01 if key == "tts_timeout" else default
+        calls = []
+
+        async def blocked_tts(*_args, **_kwargs):
+            calls.append("play")
+            await asyncio.Future()
+
+        class FakeSpeaker:
+            async def stop_device_audio(self):
+                calls.append("stop")
+
+            async def play(self, **_kwargs):
+                calls.append("replay")
+
+        controller.backend._play_response_with_tts = blocked_tts
+        controller.backend.get_tts_speaker_for_session_key = lambda: "xiaoai"
+        set_speaker(FakeSpeaker())
+
+        from unittest.mock import patch
+        import core.external_conversation as conversation_module
+
+        with (
+            patch.object(
+                conversation_module.open_xiaoai_server,
+                "begin_playback_session",
+                return_value=7,
+                create=True,
+            ),
+            patch.object(
+                conversation_module.open_xiaoai_server,
+                "stop_tts_playback",
+                side_effect=lambda token: calls.append(f"stop_tts:{token}"),
+                create=True,
+            ),
+        ):
+            await controller._play_tts("测试")
+
+        self.assertEqual(calls, ["play", "stop_tts:7", "stop"])
 
 
 if __name__ == "__main__":

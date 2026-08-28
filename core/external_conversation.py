@@ -104,6 +104,15 @@ class ExternalConversationController:
         return int(self.config.get_app_config("wakeup.timeout", 20))
 
     @property
+    def tts_timeout(self) -> float:
+        """单轮回复 TTS 的硬上限，避免设备原生 TTS 无限占用会话。"""
+        try:
+            value = float(self._cfg("tts_timeout", 30))
+        except (TypeError, ValueError):
+            value = 30.0
+        return max(1.0, value)
+
+    @property
     def input_mode(self) -> str:
         mode = self._cfg("input_mode", self.LOCAL_ASR_INPUT)
         if not isinstance(mode, str):
@@ -184,10 +193,15 @@ class ExternalConversationController:
         """Run VAD -> ASR -> backend -> TTS turns until exit."""
 
         stream_player = get_stream_player()
-        media_is_playing = bool(
-            stream_player and stream_player.get_status().get("playing")
+        media_session_active = bool(
+            stream_player
+            and (
+                stream_player.has_resumable_media()
+                if hasattr(stream_player, "has_resumable_media")
+                else stream_player.get_status().get("playing")
+            )
         )
-        if media_is_playing:
+        if media_session_active:
             # AEC 已使用同一中转 PCM 作为参考流。保持音乐和录音链路运行，
             # 避免 stop_playing RPC 进入唤醒关键路径；LISTENING 状态是反馈。
             logger.info(
@@ -588,11 +602,41 @@ class ExternalConversationController:
         """Play text via Doubao TTS (blocks until playback finishes)."""
         self._playback_token = open_xiaoai_server.begin_playback_session()
         try:
-            await self.backend._play_response_with_tts(
-                text,
-                tts_speaker=self.backend.get_tts_speaker_for_session_key(),
-                playback_token=self._playback_token,
+            await asyncio.wait_for(
+                self.backend._play_response_with_tts(
+                    text,
+                    tts_speaker=self.backend.get_tts_speaker_for_session_key(),
+                    playback_token=self._playback_token,
+                ),
+                timeout=self.tts_timeout,
             )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"TTS playback timed out after {self.tts_timeout:g}s",
+                module=self.LOG_MODULE,
+            )
+            stop_tts_playback = getattr(
+                open_xiaoai_server,
+                "stop_tts_playback",
+                None,
+            )
+            if callable(stop_tts_playback):
+                stop_tts_playback(self._playback_token)
+            speaker = get_speaker()
+            if speaker:
+                try:
+                    await asyncio.wait_for(
+                        speaker.stop_device_audio(),
+                        timeout=min(3.0, self.tts_timeout),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"Timed-out TTS cleanup failed "
+                        f"(error_type={type(exc).__name__})",
+                        module=self.LOG_MODULE,
+                    )
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             logger.error(
                 f"TTS playback error: {exc}",

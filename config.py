@@ -91,19 +91,15 @@ async def before_wakeup(speaker, text, source, app):
         #     return "openclaw"
 
         if text == "召唤龙虾":
-            await speaker.abort_xiaoai()
             return "openclaw"  # OpenClaw continuous conversation
 
         if text == "召唤小黑":
-            await speaker.abort_xiaoai()
             return "openai"  # OpenAI-compatible service continuous conversation
 
         if text == "召唤小爪":
-            await speaker.abort_xiaoai()
             return "qwenpaw"  # QwenPaw continuous conversation
 
         if text == "召唤小智":
-            await speaker.abort_xiaoai()
             return "xiaozhi"  # XiaoZhi AI
 
         if "让龙虾" in text:
@@ -341,6 +337,7 @@ APP_CONFIG = {
         # },
         "agent_tts_speakers": {},
         "response_timeout": 120,  # 等待 OpenClaw agent 响应的超时时间（秒）
+        "tts_timeout": 30,  # 单轮回复播放上限（秒），超时后清理并恢复监听/音乐
         "exit_keywords": ["退出", "停止", "再见"],  # 退出连续对话的关键词
         # rule_prompt: 用于「自动播放」和「连续对话」场景
         #   - send_to_openclaw_and_play_reply() 会自动追加
@@ -375,6 +372,7 @@ APP_CONFIG = {
         "max_tokens": 512,
         "history_max_messages": 20,
         "response_timeout": 120,
+        "tts_timeout": 30,
         # 单次 MCP 工具调用超时；应小于 response_timeout，为最终模型回复预留时间
         "tool_timeout": 30,
         # 每轮第一次 MCP 调用前阻塞播报一次；失败/超时会跳过该轮全部 MCP 调用
@@ -417,6 +415,7 @@ APP_CONFIG = {
         # 认证（可选）：非空时默认使用 Authorization 认证头
         "auth_token": "",
         "response_timeout": 120,
+        "tts_timeout": 30,
         "poll_interval": 0.5,
         "tts_speed": 1.0,
         "tts_speaker": "xiaoai",

@@ -80,6 +80,20 @@ class SpeakerManagerNativeTTSTest(unittest.IsolatedAsyncioTestCase):
             await speaker.play(text="好的，正在处理", blocking=True, timeout=1)
         )
 
+    async def test_invalid_remote_result_is_a_failure_object(self):
+        class InvalidResultXiaoAI:
+            async def run_shell(self, _script, timeout=0):
+                return None
+
+        set_xiaoai(InvalidResultXiaoAI())
+        speaker = SpeakerManager()
+
+        result = await speaker.run_shell("true")
+
+        self.assertIsInstance(result, CommandResult)
+        self.assertEqual(result.exit_code, -1)
+        self.assertFalse(await speaker.play(text="测试", blocking=True))
+
     async def test_cancellation_propagates_as_interruption(self):
         class InterruptedXiaoAI:
             async def run_shell(self, _script, timeout=0):

@@ -1,5 +1,6 @@
 """Wakeup session media-ownership regressions."""
 
+import asyncio
 import sys
 import types
 import unittest
@@ -53,6 +54,47 @@ class WakeupSessionResetTest(unittest.IsolatedAsyncioTestCase):
             with self.subTest(text=text):
                 route = await before_wakeup(speaker, text, "kws", None)
                 self.assertEqual(route, expected)
+
+    async def test_default_xiaoai_routes_do_not_restart_native_service(self):
+        class FailOnAbort:
+            async def abort_xiaoai(self):
+                raise AssertionError("XiaoAI route must not restart mico_aivs_lab")
+
+        speaker = FailOnAbort()
+        expected_routes = {
+            "召唤龙虾": "openclaw",
+            "召唤小黑": "openai",
+            "召唤小爪": "qwenpaw",
+            "召唤小智": "xiaozhi",
+        }
+        for text, expected in expected_routes.items():
+            with self.subTest(text=text):
+                route = await before_wakeup(speaker, text, "xiaoai", None)
+                self.assertEqual(route, expected)
+
+    async def test_reset_cancels_previous_external_task_before_replacement(self):
+        started = asyncio.Event()
+
+        async def previous_session():
+            started.set()
+            await asyncio.Future()
+
+        task = asyncio.create_task(previous_session())
+        await started.wait()
+        controller = types.SimpleNamespace(
+            is_active=lambda: True,
+            stop=lambda: None,
+        )
+        self.manager._openai_controller = controller
+        self.manager._openai_task = task
+
+        fake_xiaoai = types.SimpleNamespace(
+            XiaoAI=types.SimpleNamespace(stop_conversation=lambda: None)
+        )
+        with patch.dict(sys.modules, {"core.xiaoai": fake_xiaoai}):
+            await self.manager.reset_all_sessions()
+
+        self.assertTrue(task.cancelled())
 
 
 if __name__ == "__main__":

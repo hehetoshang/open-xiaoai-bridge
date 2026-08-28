@@ -7,7 +7,7 @@ import time
 import numpy as np
 import open_xiaoai_server
 
-from core.ref import get_speaker, set_xiaoai
+from core.ref import get_app, get_speaker, set_xiaoai
 from core.services.audio.aec import AEC
 from core.services.audio.stream import GlobalStream
 from core.services.speaker import SpeakerManager
@@ -73,26 +73,31 @@ class XiaoAI:
         return bool(normalized) and normalized in cls._external_wakeup_keywords
 
     @classmethod
-    async def _suppress_dialog(cls, dialog_id: str, reason: str):
+    def _claim_dialog(cls, dialog_id: str, reason: str) -> bool:
+        """立即标记原生对话已由 bridge 接管，不等待设备 RPC。"""
+        if not dialog_id:
+            return False
+        if len(cls._suppressed_dialog_ids) >= cls._MAX_SUPPRESSED_DIALOGS:
+            cls._suppressed_dialog_ids.clear()
+            cls._suppressed_dialog_last_attempt.clear()
+        is_new_dialog = dialog_id not in cls._suppressed_dialog_ids
+        cls._suppressed_dialog_ids.add(dialog_id)
+        if is_new_dialog:
+            logger.info(f"[XiaoAI] 🛑 停止小爱当前对话: {reason}")
+        return is_new_dialog
+
+    @classmethod
+    async def _suppress_dialog(
+        cls,
+        dialog_id: str,
+        reason: str,
+        *,
+        initial_claim: bool = False,
+    ):
         if not dialog_id:
             return
 
-        # Prevent unbounded growth: if too many stale dialog_ids accumulated
-        # (missed Dialog.Finish events), clear them all before adding new one
-        if len(cls._suppressed_dialog_ids) >= cls._MAX_SUPPRESSED_DIALOGS:
-            logger.debug(
-                f"[XiaoAI] Clearing {len(cls._suppressed_dialog_ids)} stale suppressed dialog_ids"
-            )
-            cls._suppressed_dialog_ids.clear()
-            cls._suppressed_dialog_last_attempt.clear()
-
-        is_new_dialog = dialog_id not in cls._suppressed_dialog_ids
-        cls._suppressed_dialog_ids.add(dialog_id)
-
-        if is_new_dialog:
-            logger.info(
-                f"[XiaoAI] 🛑 停止小爱当前对话: {reason}"
-            )
+        is_new_dialog = cls._claim_dialog(dialog_id, reason)
 
         now = time.monotonic()
         last_attempt = cls._suppressed_dialog_last_attempt.get(dialog_id, 0.0)
@@ -104,12 +109,26 @@ class XiaoAI:
             await cls.speaker.run_shell(
                 "killall tts_play.sh miplayer 2>/dev/null; mphelper pause"
             )
-            if is_new_dialog:
+            if is_new_dialog or initial_claim:
                 await cls.speaker.wake_up(awake=False)
         except Exception as exc:
             logger.debug(
                 f"[XiaoAI] Failed to pause suppressed dialog {dialog_id}: {exc}"
             )
+
+    @classmethod
+    async def _dispatch_wakeup(cls, text: str, source: str, **kwargs):
+        """把业务状态机固定调度到 MainApp.loop，XiaoAI loop 只做事件桥接。"""
+        current_loop = asyncio.get_running_loop()
+        app = get_app()
+        target_loop = getattr(app, "loop", None) if app else None
+        if target_loop is None or not target_loop.is_running():
+            target_loop = current_loop
+        coroutine = EventManager.wakeup(text, source, **kwargs)
+        if target_loop is current_loop:
+            return await coroutine
+        future = asyncio.run_coroutine_threadsafe(coroutine, target_loop)
+        return await asyncio.wrap_future(future)
 
     @classmethod
     def on_input_data(cls, data: bytes):
@@ -234,11 +253,16 @@ class XiaoAI:
                         cls.conversation.reset_retries()
                         EventManager.on_interrupt()
                     elif text and is_final and cls._is_external_wakeup_text(text):
-                        await cls._suppress_dialog(
-                            dialog_id,
-                            f"外部唤醒词接管: {text}",
+                        reason = f"外部唤醒词接管: {text}"
+                        cls._claim_dialog(dialog_id, reason)
+                        asyncio.create_task(
+                            cls._suppress_dialog(
+                                dialog_id,
+                                reason,
+                                initial_claim=True,
+                            )
                         )
-                        await EventManager.wakeup(text, "kws")
+                        await cls._dispatch_wakeup(text, "kws")
                         return
                     elif text and is_final:
                         logger.info(f"[XiaoAI] 🔥 收到指令: {text}")
@@ -247,7 +271,24 @@ class XiaoAI:
                             text,
                             get_speaker(),
                         )
-                        await EventManager.wakeup(text, "xiaoai")
+                        def _claim_routed_dialog(route):
+                            if route is None or not dialog_id:
+                                return
+                            reason = f"Bridge 路由接管: {text}"
+                            cls._claim_dialog(dialog_id, reason)
+                            asyncio.create_task(
+                                cls._suppress_dialog(
+                                    dialog_id,
+                                    reason,
+                                    initial_claim=True,
+                                )
+                            )
+
+                        await cls._dispatch_wakeup(
+                            text,
+                            "xiaoai",
+                            on_route_resolved=_claim_routed_dialog,
+                        )
                     elif is_final and not text:
                         logger.debug("[XiaoAI] 🛑 小爱监听超时自动退出")
                         await cls.conversation.handle_listening_timeout(
