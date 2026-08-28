@@ -150,6 +150,106 @@ class OpenAIToolLoopTest(unittest.TestCase):
 
         self.manager._post_chat_completion = classmethod(fake_post)
 
+    def test_default_prompt_keeps_music_as_an_optional_capability(self):
+        """内置身份是通用助手，音乐工具仅响应明确的操作意图。"""
+        prompt = self.manager._resolve_system_prompt("")
+
+        self.assertEqual(prompt, self.manager._resolve_system_prompt(None))
+        self.assertIn("通用 AI 语音助手", prompt)
+        self.assertIn("外部工具只是可选能力", prompt)
+        self.assertIn("音乐理论等知识问题不属于音乐操作", prompt)
+        self.assertIn("搜索但不要播放", prompt)
+        self.assertIn("不能擅自播放", prompt)
+        self.assertIn("不要把自己称为音乐助手或播放器", prompt)
+        self.assertIn("不要提及 MCP", prompt)
+
+    def test_default_prompt_is_sent_with_ordinary_questions_and_tools(self):
+        """普通问题也携带通用身份约束，但工具是否启用不受影响。"""
+        self.manager._system_prompt = self.manager.DEFAULT_SYSTEM_PROMPT
+        self._set_sequential_responses([make_text_response("四")])
+
+        result = self.run_async(self.manager._request_chat_completion("二加二等于几？"))
+
+        self.assertEqual(result, "四")
+        payload = self.captured_payloads[0]
+        self.assertEqual(payload["messages"][0]["role"], "system")
+        self.assertEqual(
+            payload["messages"][0]["content"],
+            self.manager.DEFAULT_SYSTEM_PROMPT,
+        )
+        self.assertIn("tools", payload)
+        self.assertEqual(self.mcp_stub.call_history, [])
+        self.assertEqual(self.tts_calls, [])
+
+    def test_identity_question_stays_a_general_assistant_text_reply(self):
+        """自我介绍直接回答，音乐只作为可选能力且不触发工具。"""
+        self.manager._system_prompt = self.manager.DEFAULT_SYSTEM_PROMPT
+        self._set_sequential_responses(
+            [make_text_response("我是通用 AI 助手，也可以在需要时帮你播放音乐。")]
+        )
+
+        result = self.run_async(self.manager._request_chat_completion("你是谁？"))
+
+        self.assertEqual(result, "我是通用 AI 助手，也可以在需要时帮你播放音乐。")
+        self.assertEqual(self.mcp_stub.call_history, [])
+        self.assertEqual(self.tts_calls, [])
+
+    def test_music_theory_question_does_not_call_music_tools(self):
+        """提到音乐但没有操作意图时正常解释，不调用或确认工具。"""
+        self.manager._system_prompt = self.manager.DEFAULT_SYSTEM_PROMPT
+        self._set_sequential_responses(
+            [make_text_response("五度圈用于表示十二个调之间的关系。")]
+        )
+
+        result = self.run_async(self.manager._request_chat_completion("解释一下音乐里的五度圈"))
+
+        self.assertEqual(result, "五度圈用于表示十二个调之间的关系。")
+        self.assertEqual(self.mcp_stub.call_history, [])
+        self.assertEqual(self.tts_calls, [])
+
+    def test_search_without_playing_calls_search_only(self):
+        """“只搜索”严格限制在查询，不会擅自追加播放调用。"""
+        self.manager._system_prompt = self.manager.DEFAULT_SYSTEM_PROMPT
+        self._set_sequential_responses(
+            [
+                make_tool_call_response("search_track", {"query": "周杰伦"}),
+                make_text_response("找到多首周杰伦的歌曲。"),
+            ]
+        )
+
+        result = self.run_async(
+            self.manager._request_chat_completion("搜索周杰伦，但不要播放")
+        )
+
+        self.assertEqual(result, "找到多首周杰伦的歌曲。")
+        self.assertEqual(
+            self.mcp_stub.call_history,
+            [("search_track", {"query": "周杰伦"})],
+        )
+        self.assertEqual(self.tts_calls, ["好的，正在处理"])
+
+    def test_custom_prompt_can_override_general_assistant_default(self):
+        """显式配置仍可完整覆盖内置提示词。"""
+        custom_prompt = "你是家庭助理。"
+
+        self.assertEqual(
+            self.manager._resolve_system_prompt(f"  {custom_prompt}  "),
+            custom_prompt,
+        )
+
+        messages = self.manager._build_messages([], "你好")
+        self.assertEqual(messages, [{"role": "user", "content": "你好"}])
+
+        self.manager._system_prompt = custom_prompt
+        messages = self.manager._build_messages([], "你好")
+        self.assertEqual(
+            messages,
+            [
+                {"role": "system", "content": custom_prompt},
+                {"role": "user", "content": "你好"},
+            ],
+        )
+
     def test_tool_loop_executes_and_returns_final_text(self):
         """工具调用 → 执行 → 携带 tool 消息重发 → 返回最终文本"""
         self._set_sequential_responses(
