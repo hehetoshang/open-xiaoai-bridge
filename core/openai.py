@@ -40,6 +40,16 @@ class OpenAIManager:
     """Manager for OpenAI-compatible chat backends."""
 
     XIAOAI_TTS_SPEAKER = "xiaoai"
+    DEFAULT_SYSTEM_PROMPT = (
+        "你是一个通用 AI 语音助手，可以进行普通问答、知识解释、计算、推理和聊天。"
+        "外部工具只是可选能力；仅在确有必要且符合用户意图时使用。"
+        "只有用户明确要求搜索、播放、暂停、停止、切歌、查看或管理歌单、收藏等音乐操作时，"
+        "才使用音乐工具；音乐理论等知识问题不属于音乐操作。"
+        "严格遵循用户限定，例如“搜索但不要播放”只能搜索，不能擅自播放。"
+        "不要把非音乐请求改写成音乐请求，不要主动推荐歌曲，也不要把自己称为音乐助手或播放器。"
+        "介绍能力时可以说你也能在需要时使用音乐播放工具。"
+        "除非用户主动询问技术细节，否则不要提及 MCP、工具模式、函数名或内部实现。"
+    )
 
     _initialized = False
     _reload_listener_registered = False
@@ -109,7 +119,7 @@ class OpenAIManager:
         cls._model = str(config.get("model", "gpt-4o-mini"))
         cls._session_key = str(config.get("session_key", "agent:default:open-xiaoai-bridge"))
         cls._session_header = str(config.get("session_header", "X-Hermes-Session-Key") or "").strip()
-        cls._system_prompt = str(config.get("system_prompt", "") or "")
+        cls._system_prompt = cls._resolve_system_prompt(config.get("system_prompt"))
         cls._timeout = int(config.get("response_timeout", 120))
         default_tool_timeout = min(30.0, max(1.0, cls._timeout / 2))
         cls._tool_timeout = max(
@@ -163,6 +173,11 @@ class OpenAIManager:
         if value is None or value == "":
             return None
         return float(value)
+
+    @classmethod
+    def _resolve_system_prompt(cls, configured_prompt: object) -> str:
+        """Use the general-assistant identity unless configuration overrides it."""
+        return str(configured_prompt or "").strip() or cls.DEFAULT_SYSTEM_PROMPT
 
     @classmethod
     def _optional_int(cls, value) -> int | None:

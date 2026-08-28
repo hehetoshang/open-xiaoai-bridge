@@ -525,7 +525,7 @@ if "让小黑" in text:
     return None
 ```
 
-`base_url` 可以直接填到 `/v1`，框架会自动调用 `/chat/completions`；如果你的服务已经给出完整 `/v1/chat/completions` 地址，也可以直接填写完整地址。连续对话会按 `session_key` 保存最近 `history_max_messages` 条上下文；需要隔离多个助手时，可在唤醒前调用 `app.set_openai_session_key("assistant-name")`。启用 MCP 工具时，每轮第一次真实调用前会完整播报 `tool_confirmation_text`，同轮后续工具和重试不会重复播报；确认播放失败或超过 `tool_confirmation_timeout` 时，本轮所有 MCP 调用都会跳过并转入现有错误回复路径。`tool_timeout` 会限制每次工具调用，超时结果会回传给模型，让模型在 `response_timeout` 到期前给出可诊断回复；整轮超时后 bridge 会取消仍在运行的请求和工具任务，避免迟到的副作用。
+`base_url` 可以直接填到 `/v1`，框架会自动调用 `/chat/completions`；如果你的服务已经给出完整 `/v1/chat/completions` 地址，也可以直接填写完整地址。`system_prompt` 留空时使用内置的通用语音助手身份：音乐等外部工具只是按用户明确意图使用的可选能力；填写非空值可完整覆盖该提示词。连续对话会按 `session_key` 保存最近 `history_max_messages` 条上下文；需要隔离多个助手时，可在唤醒前调用 `app.set_openai_session_key("assistant-name")`。启用 MCP 工具时，每轮第一次真实调用前会完整播报 `tool_confirmation_text`，同轮后续工具和重试不会重复播报；确认播放失败或超过 `tool_confirmation_timeout` 时，本轮所有 MCP 调用都会跳过并转入现有错误回复路径。`tool_timeout` 会限制每次工具调用，超时结果会回传给模型，让模型在 `response_timeout` 到期前给出可诊断回复；整轮超时后 bridge 会取消仍在运行的请求和工具任务，避免迟到的副作用。
 
 ## 🐾 QwenPaw 集成
 

@@ -370,6 +370,8 @@ APP_CONFIG = {
         # chat/completions 仍是无状态（历史仍由 messages 携带），不会重复。
         # 接标准 OpenAI/Ollama/LM Studio 时该头会被忽略（无害），如需彻底关闭可留空。
         "session_header": "X-Hermes-Session-Key",
+        # 留空时使用内置的通用语音助手提示词；填写非空值可完整覆盖。
+        # 内置提示词将音乐等外部工具定位为按用户明确意图使用的可选能力。
         "system_prompt": "",
         "temperature": 0.7,
         "max_tokens": 512,
