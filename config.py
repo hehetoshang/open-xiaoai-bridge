@@ -377,6 +377,9 @@ APP_CONFIG = {
         "response_timeout": 120,
         # 单次 MCP 工具调用超时；应小于 response_timeout，为最终模型回复预留时间
         "tool_timeout": 30,
+        # 每轮第一次 MCP 调用前阻塞播报一次；失败/超时会跳过该轮全部 MCP 调用
+        "tool_confirmation_text": "好的，正在处理",
+        "tool_confirmation_timeout": 15,
         "tts_speed": 1.0,
         "tts_speaker": "xiaoai",
         "session_tts_speakers": {},

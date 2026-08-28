@@ -119,8 +119,24 @@ class OpenAIToolLoopTest(unittest.TestCase):
         self.manager._extra_body = {}
         self.manager._history_max_messages = 20
         self.manager._timeout = 30
+        self.manager._tool_timeout = 1
+        self.manager._tool_confirmation_text = "好的，正在处理"
+        self.manager._tool_confirmation_timeout = 1
         self.manager._use_mcp_tools = True
         self.manager._max_tool_rounds = 5
+        self.manager._initialized = True
+        self.manager._enabled = True
+        self.manager._response_events = {}
+        self.manager._response_tasks = {}
+        self.manager._response_texts = {}
+        self.manager._response_tts_speakers = {}
+        self.tts_calls = []
+
+        async def fake_tts(cls, text, **kwargs):
+            self.tts_calls.append(text)
+            return True
+
+        self.manager._play_response_with_tts = classmethod(fake_tts)
 
     def run_async(self, coro):
         return asyncio.run(coro)
@@ -206,6 +222,125 @@ class OpenAIToolLoopTest(unittest.TestCase):
         self.assertEqual(
             sorted(self.mcp_stub.call_history), sorted([("weather", {"city": "北京"}), ("slow_tool", {})])
         )
+        self.assertEqual(self.tts_calls, ["好的，正在处理"])
+
+    def test_confirmation_finishes_before_first_mcp_call(self):
+        """确认语完整播完后才允许触发首个 MCP 调用"""
+        events = []
+        original_call_tool = self.mcp_stub.call_tool
+
+        async def delayed_confirmation(cls, text, **kwargs):
+            events.append("confirmation_started")
+            await asyncio.sleep(0.01)
+            events.append("confirmation_finished")
+            return True
+
+        async def ordered_call_tool(name, arguments):
+            events.append("mcp_called")
+            return await original_call_tool(name, arguments)
+
+        self.manager._play_response_with_tts = classmethod(delayed_confirmation)
+        self.mcp_stub.call_tool = ordered_call_tool
+        self._set_sequential_responses(
+            [
+                make_tool_call_response("weather", {"city": "北京"}),
+                make_text_response("北京晴天"),
+            ]
+        )
+
+        result = self.run_async(self.manager._request_chat_completion("查天气"))
+
+        self.assertEqual(result, "北京晴天")
+        self.assertEqual(
+            events,
+            ["confirmation_started", "confirmation_finished", "mcp_called"],
+        )
+
+    def test_sequential_tool_rounds_confirm_only_once(self):
+        """搜索后播放等连续工具轮次只在第一次 MCP 前确认"""
+        self._set_sequential_responses(
+            [
+                make_tool_call_response("weather", {"city": "北京"}, "search-1"),
+                make_tool_call_response("play_track", {"query": "测试歌曲"}, "play-1"),
+            ]
+        )
+
+        result = self.run_async(self.manager._request_chat_completion("搜索并播放测试歌曲"))
+
+        self.assertTrue(self.manager.is_silent_end_turn_result(result))
+        self.assertEqual(self.tts_calls, ["好的，正在处理"])
+        self.assertEqual(
+            self.mcp_stub.call_history,
+            [
+                ("weather", {"city": "北京"}),
+                ("play_track", {"query": "测试歌曲"}),
+            ],
+        )
+
+    def test_new_turn_confirms_again(self):
+        """前置确认状态属于单轮，新用户轮次会重新确认"""
+        for city in ("北京", "上海"):
+            self._set_sequential_responses(
+                [
+                    make_tool_call_response("weather", {"city": city}),
+                    make_text_response(f"{city}晴天"),
+                ]
+            )
+            result = self.run_async(
+                self.manager._request_chat_completion(f"查{city}天气")
+            )
+            self.assertEqual(result, f"{city}晴天")
+
+        self.assertEqual(
+            self.tts_calls,
+            ["好的，正在处理", "好的，正在处理"],
+        )
+
+    def test_confirmation_failure_skips_mcp_and_uses_error_recovery(self):
+        """确认播放失败时不调用 MCP，并把可操作错误交给模型"""
+
+        async def failed_confirmation(cls, text, **kwargs):
+            self.tts_calls.append(text)
+            return False
+
+        self.manager._play_response_with_tts = classmethod(failed_confirmation)
+        self._set_sequential_responses(
+            [
+                make_tool_call_response("weather", {"city": "北京"}),
+                make_text_response("语音确认失败，请检查音箱连接后重试"),
+            ]
+        )
+
+        result = self.run_async(self.manager._request_chat_completion("查天气"))
+
+        self.assertEqual(result, "语音确认失败，请检查音箱连接后重试")
+        self.assertEqual(self.mcp_stub.call_history, [])
+        self.assertEqual(self.tts_calls, ["好的，正在处理"])
+        self.assertIn("工具未执行", self.captured_payloads[1]["messages"][-1]["content"])
+
+    def test_confirmation_timeout_skips_mcp(self):
+        """确认播放超时会取消等待且绝不调用 MCP"""
+
+        async def slow_confirmation(cls, text, **kwargs):
+            self.tts_calls.append(text)
+            await asyncio.sleep(1)
+            return True
+
+        self.manager._tool_confirmation_timeout = 0.01
+        self.manager._play_response_with_tts = classmethod(slow_confirmation)
+        self._set_sequential_responses(
+            [
+                make_tool_call_response("weather", {"city": "北京"}),
+                make_text_response("语音确认超时，请检查音箱连接后重试"),
+            ]
+        )
+
+        result = self.run_async(self.manager._request_chat_completion("查天气"))
+
+        self.assertEqual(result, "语音确认超时，请检查音箱连接后重试")
+        self.assertEqual(self.mcp_stub.call_history, [])
+        self.assertEqual(self.tts_calls, ["好的，正在处理"])
+        self.assertIn("播放超时", self.captured_payloads[1]["messages"][-1]["content"])
 
     def test_playback_success_skips_final_model_request(self):
         """播放成功信号立即静默终止，不再请求模型生成确认文本"""
@@ -219,6 +354,7 @@ class OpenAIToolLoopTest(unittest.TestCase):
         self.assertEqual(len(self.captured_payloads), 1)
         self.assertEqual(self.mcp_stub.call_history, [("play_track", {"query": "测试歌曲"})])
         self.assertEqual(self.manager._sessions["test-session"], [])
+        self.assertEqual(self.tts_calls, ["好的，正在处理"])
 
     def test_playback_failure_still_requests_audible_reply(self):
         """播放失败作为工具错误交给模型，保留最终可播报回复"""
@@ -292,6 +428,16 @@ class OpenAIToolLoopTest(unittest.TestCase):
         result = self.run_async(self.manager._request_chat_completion("你好"))
         self.assertEqual(result, "普通回复")
         self.assertNotIn("tools", self.captured_payloads[0])
+        self.assertEqual(self.mcp_stub.call_history, [])
+
+    def test_ordinary_chat_with_tools_enabled_has_no_confirmation(self):
+        """工具能力已启用但模型不调用 MCP 时，不插入前置确认"""
+        self._set_sequential_responses([make_text_response("你好，有什么可以帮你？")])
+
+        result = self.run_async(self.manager._request_chat_completion("你好"))
+
+        self.assertEqual(result, "你好，有什么可以帮你？")
+        self.assertEqual(self.tts_calls, [])
         self.assertEqual(self.mcp_stub.call_history, [])
 
     def test_playback_success_ends_turn_without_followup_model_call(self):
@@ -422,6 +568,39 @@ class OpenAIToolLoopTest(unittest.TestCase):
 
         self.assertTrue(self.manager.is_silent_end_turn_result(result))
         self.assertEqual(tts_calls, [])
+
+    def test_send_and_play_playback_success_has_no_post_tts(self):
+        """播放成功时只有前置确认，没有成功后的 AI 语音"""
+        self._set_sequential_responses(
+            [make_tool_call_response("play_track", {"query": "测试歌曲"})]
+        )
+
+        result = self.run_async(
+            self.manager.send_and_play_reply("播放测试歌曲", wait_response=True)
+        )
+
+        self.assertTrue(self.manager.is_silent_end_turn_result(result))
+        self.assertEqual(self.tts_calls, ["好的，正在处理"])
+        self.assertEqual(len(self.captured_payloads), 1)
+
+    def test_send_and_play_mcp_failure_still_plays_error_reply(self):
+        """MCP 失败时保留前置确认和最终失败播报"""
+        self._set_sequential_responses(
+            [
+                make_tool_call_response("play_failed", {}),
+                make_text_response("播放失败，请稍后再试"),
+            ]
+        )
+
+        result = self.run_async(
+            self.manager.send_and_play_reply("播放测试歌曲", wait_response=True)
+        )
+
+        self.assertEqual(result, "播放失败，请稍后再试")
+        self.assertEqual(
+            self.tts_calls,
+            ["好的，正在处理", "播放失败，请稍后再试"],
+        )
 
 
 if __name__ == "__main__":

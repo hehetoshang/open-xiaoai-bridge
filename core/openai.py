@@ -28,6 +28,14 @@ class OpenAITurnDirective(Enum):
     SILENT_END = "silent_end"
 
 
+class ToolConfirmationState(Enum):
+    """State of the mandatory pre-tool voice confirmation for one turn."""
+
+    PENDING = "pending"
+    COMPLETE = "complete"
+    FAILED = "failed"
+
+
 class OpenAIManager:
     """Manager for OpenAI-compatible chat backends."""
 
@@ -49,6 +57,8 @@ class OpenAIManager:
     _max_tokens: int | None = None
     _timeout = 120
     _tool_timeout = 30.0
+    _tool_confirmation_text = "好的，正在处理"
+    _tool_confirmation_timeout = 15.0
     _history_max_messages = 20
     _extra_body: dict[str, Any] = {}
     _tts_speaker = None
@@ -107,6 +117,17 @@ class OpenAIManager:
             min(
                 float(config.get("tool_timeout", default_tool_timeout)),
                 max(0.1, cls._timeout - 5),
+            ),
+        )
+        cls._tool_confirmation_text = (
+            str(config.get("tool_confirmation_text", "好的，正在处理") or "").strip()
+            or "好的，正在处理"
+        )
+        cls._tool_confirmation_timeout = max(
+            1.0,
+            min(
+                float(config.get("tool_confirmation_timeout", 15)),
+                max(1.0, cls._timeout - 5),
             ),
         )
         cls._history_max_messages = max(0, int(config.get("history_max_messages", 20)))
@@ -341,6 +362,8 @@ class OpenAIManager:
         history = cls._sessions.setdefault(session_key, [])
         messages = cls._build_messages(history, text)
         final_text: str | None = None
+        tool_confirmation_state = ToolConfirmationState.PENDING
+        tool_confirmation_error = ""
 
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=cls._timeout)
@@ -400,20 +423,43 @@ class OpenAIManager:
                         "reasoning_content"
                     ]
                 messages.append(assistant_tool_message)
-                # 并发执行本轮的多个工具调用
-                results = await asyncio.gather(
-                    *(cls._run_tool_call(tc) for tc in tool_calls),
-                    return_exceptions=True,
-                )
-                normalized_results = [
-                    result
-                    if isinstance(result, ToolCallResult)
-                    else ToolCallResult(
-                        text=f"工具执行失败: {result}",
-                        is_error=True,
+                if tool_confirmation_state is ToolConfirmationState.PENDING:
+                    confirmed, tool_confirmation_error = (
+                        await cls._play_tool_confirmation()
                     )
-                    for result in results
-                ]
+                    tool_confirmation_state = (
+                        ToolConfirmationState.COMPLETE
+                        if confirmed
+                        else ToolConfirmationState.FAILED
+                    )
+
+                if tool_confirmation_state is ToolConfirmationState.FAILED:
+                    # The model still receives a normal tool error so the existing
+                    # recovery/final-TTS path remains active, but no MCP side effect
+                    # can occur. A model retry in this turn reuses FAILED and does
+                    # not replay the confirmation.
+                    normalized_results = [
+                        ToolCallResult(
+                            text=tool_confirmation_error,
+                            is_error=True,
+                        )
+                        for _ in tool_calls
+                    ]
+                else:
+                    # 并发执行本轮的多个工具调用
+                    results = await asyncio.gather(
+                        *(cls._run_tool_call(tc) for tc in tool_calls),
+                        return_exceptions=True,
+                    )
+                    normalized_results = [
+                        result
+                        if isinstance(result, ToolCallResult)
+                        else ToolCallResult(
+                            text=f"工具执行失败: {result}",
+                            is_error=True,
+                        )
+                        for result in results
+                    ]
                 should_end_silently = any(
                     result.silent_end_turn for result in normalized_results
                 )
@@ -555,6 +601,74 @@ class OpenAIManager:
             )
 
     @classmethod
+    async def _play_tool_confirmation(cls) -> tuple[bool, str]:
+        """Play and fully await the mandatory confirmation before any MCP call."""
+        try:
+            played = await asyncio.wait_for(
+                cls._play_response_with_tts(
+                    cls._tool_confirmation_text,
+                    tts_speaker=cls.get_tts_speaker_for_session_key(),
+                ),
+                timeout=cls._tool_confirmation_timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Tool confirmation TTS timed out; MCP calls were skipped",
+                module="OpenAI",
+            )
+            await cls._stop_failed_tool_confirmation()
+            return (
+                False,
+                "工具未执行：语音确认播放超时，请检查音箱连接后重试。",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Tool confirmation TTS failed; MCP calls were skipped "
+                f"(error_type={type(exc).__name__})",
+                module="OpenAI",
+            )
+            await cls._stop_failed_tool_confirmation()
+            return (
+                False,
+                "工具未执行：语音确认播放失败，请检查音箱连接或 TTS 配置后重试。",
+            )
+
+        if played is False:
+            logger.warning(
+                "Tool confirmation TTS did not complete; MCP calls were skipped",
+                module="OpenAI",
+            )
+            await cls._stop_failed_tool_confirmation()
+            return (
+                False,
+                "工具未执行：语音确认播放失败，请检查音箱连接或 TTS 配置后重试。",
+            )
+
+        logger.debug("Tool confirmation TTS completed", module="OpenAI")
+        return True, ""
+
+    @classmethod
+    async def _stop_failed_tool_confirmation(cls):
+        """Best-effort cleanup for a failed or timed-out confirmation playback."""
+        try:
+            from core.ref import get_speaker
+
+            speaker = get_speaker()
+            if speaker:
+                await asyncio.wait_for(
+                    speaker.stop_device_audio(),
+                    timeout=min(5.0, cls._tool_confirmation_timeout),
+                )
+        except Exception as exc:
+            logger.warning(
+                "Unable to stop failed tool confirmation playback "
+                f"(error_type={type(exc).__name__})",
+                module="OpenAI",
+            )
+
+    @classmethod
     def _headers(cls) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
         if cls._api_key:
@@ -642,7 +756,7 @@ class OpenAIManager:
         text: str,
         tts_speaker: str | None = None,
         playback_token: int | None = None,
-    ):
+    ) -> bool:
         """Synthesize text and play it through the speaker."""
         try:
             from core.ref import get_speaker
@@ -651,8 +765,8 @@ class OpenAIManager:
             if resolved_tts_speaker == cls.XIAOAI_TTS_SPEAKER:
                 speaker = get_speaker()
                 if speaker:
-                    await speaker.play(text=text, blocking=True)
-                return
+                    return (await speaker.play(text=text, blocking=True)) is not False
+                return False
 
             from core.services.tts.doubao import DoubaoTTS
 
@@ -665,8 +779,8 @@ class OpenAIManager:
                 )
                 speaker = get_speaker()
                 if speaker:
-                    await speaker.play(text=text, blocking=True)
-                return
+                    return (await speaker.play(text=text, blocking=True)) is not False
+                return False
 
             # 打断中转推流播放（AI 回复优先，避免与播歌/听书混音）
             from core.ref import get_stream_player
@@ -708,13 +822,21 @@ class OpenAIManager:
                     sample_rate=24000,
                     playback_token=playback_token,
                 )
+            return True
         except Exception as exc:
-            logger.error(f"[OpenAI] Error playing response with TTS: {exc}")
+            logger.error(
+                "[OpenAI] Error playing response with TTS "
+                f"(error_type={type(exc).__name__})"
+            )
             try:
                 from core.ref import get_speaker
 
                 speaker = get_speaker()
                 if speaker:
-                    await speaker.play(text=text, blocking=True)
+                    return (await speaker.play(text=text, blocking=True)) is not False
             except Exception as fallback_error:
-                logger.error(f"[OpenAI] Fallback TTS also failed: {fallback_error}")
+                logger.error(
+                    "[OpenAI] Fallback TTS also failed "
+                    f"(error_type={type(fallback_error).__name__})"
+                )
+            return False
