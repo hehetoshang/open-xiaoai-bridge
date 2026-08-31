@@ -474,6 +474,44 @@ npx @modelcontextprotocol/inspector
 
 启动：`OPENAI_ENABLE=1 uv run main.py`。对话时模型可调用外部工具（如查天气），工具结果由音箱 TTS 播报。
 
+#### neteasecli 账号歌单
+
+将 neteasecli 作为本地 stdio MCP server 接入后，bridge 可完成“列出账号歌单 →
+按稳定 ID 选择 → 建立音箱播放队列”的完整链路：
+
+```python
+"mcp_servers": {
+    "neteasecli": {
+        "type": "stdio",
+        "command": "node",
+        "args": ["/absolute/path/to/neteasecli/dist/index.js", "mcp"],
+        "cwd": "/absolute/path/to/neteasecli",
+        "env": {
+            "NETEASECLI_PLAYER": "xiaoai",
+            "OPENXIAOAI_BASE_URL": "http://127.0.0.1:9092",
+        },
+        "enabled": True,
+        "timeout": 120,
+    },
+},
+"openai": {
+    # ...base_url/model 等现有配置
+    "use_mcp_tools": True,
+},
+```
+
+先在同一运行账号下执行 `neteasecli auth login`，不要把 `MUSIC_U` Cookie 写入
+bridge 配置或日志。`list_account_playlists` 会返回 `liked`、`created`、
+`subscribed` 分类和稳定 ID；`play_account_playlist` 优先接受该 ID，也支持唯一的
+精确名称，以及 `liked` / `我喜欢的音乐` / `我的收藏` 三个固定别名。重名不会
+猜测，而会返回候选 ID。可重复联调示例：“列出我的网易云歌单”→“播放 ID
+123456 的歌单”；也可直接说“播放我的收藏”。
+
+调用失败会以可判断的 `[CODE] message` 返回模型：未登录/失效分别为
+`AUTH_REQUIRED` / `AUTH_EXPIRED`，另有 `PLAYLIST_NOT_FOUND`、
+`PLAYLIST_AMBIGUOUS`、`PLAYLIST_EMPTY`、`NO_PLAYABLE_TRACKS` 和 `API_ERROR`。
+播放成功沿用 bridge 的静默结束信号，不会在音乐开始后再叠加一段 TTS。
+
 ***
 
 ## 🔌 OpenAI 兼容服务
