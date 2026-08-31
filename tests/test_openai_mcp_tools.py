@@ -600,6 +600,35 @@ class OpenAIToolLoopTest(unittest.TestCase):
         self.assertEqual(len(self.captured_payloads), 1)
         self.assertEqual(self.manager._sessions["test-session"], [])
 
+    def test_account_playlist_list_then_play_chain(self):
+        """账号歌单先查询稳定 ID，再播放；成功后静默结束。"""
+        self.mcp_stub.results["list_account_playlists"] = ToolCallResult(
+            text="账号歌单共 1 个：通勤 [id:123]（created，12 首）"
+        )
+        self.mcp_stub.results["play_account_playlist"] = ToolCallResult(
+            text="正在播放歌单“通勤”",
+            silent_end_turn=True,
+        )
+        self._set_sequential_responses(
+            [
+                make_tool_call_response("list_account_playlists", {}),
+                make_tool_call_response("play_account_playlist", {"selector": "123"}),
+            ]
+        )
+
+        result = self.run_async(self.manager._request_chat_completion("播放我的通勤歌单"))
+
+        self.assertTrue(self.manager.is_silent_end_turn_result(result))
+        self.assertEqual(
+            self.mcp_stub.call_history,
+            [
+                ("list_account_playlists", {}),
+                ("play_account_playlist", {"selector": "123"}),
+            ],
+        )
+        self.assertEqual(len(self.captured_payloads), 2)
+        self.assertEqual(self.manager._sessions["test-session"], [])
+
     def test_playback_failure_is_returned_to_model(self):
         failure = "open-xiaoai-bridge POST /api/stream/play failed (HTTP 400): URL 被拒绝"
         self.mcp_stub.results["play_track"] = ToolCallResult(

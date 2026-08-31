@@ -309,6 +309,9 @@ APP_CONFIG = {
         #     "enabled": False,
         #     "timeout": 120,
         # },
+        # 启用后还需把 openai.use_mcp_tools 设为 True。模型会先调用
+        # list_account_playlists 获取稳定 ID，再调用 play_account_playlist；
+        # neteasecli 登录 Cookie 仅从其本地 profile 读取，不要写入这里的 env。
     },
     # OpenClaw Configuration
     "openclaw": {
